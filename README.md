@@ -43,10 +43,12 @@ un mensaje y conserva la información anterior de esa hoja únicamente.
 
 Sheet1 puede traer, además de las columnas de siempre, dos columnas opcionales:
 
-- **Inventario**: se toma como una foto del nivel de stock — la app muestra el
-  último valor reportado por marca (nunca se suma entre semanas, igual criterio
-  que Rotación). Aparece como KPI, como columna en la tabla por marca y como
-  gráfico Top N en la vista KPI.
+- **Inventario**: llega en máscara de miles de USD (igual que Venta y
+  Contribución), así que la app lo convierte a USD automáticamente. Se toma
+  como una foto del nivel de stock — se muestra el último valor reportado por
+  marca (nunca se suma entre semanas, igual criterio que Rotación). Aparece
+  como KPI, como columna en la tabla por marca y como gráfico Top N en la
+  vista KPI, siempre en USD.
 - **Presupuesto de contribución**: es un total por marca (no una serie
   semanal) — la app toma el último valor no vacío reportado para esa marca y
   lo compara contra la Contribución real del mes en curso con el mismo

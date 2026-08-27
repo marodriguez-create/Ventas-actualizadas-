@@ -21,9 +21,10 @@ construcción del dashboard:
 - El archivo recurrente que se sube para refrescar datos siempre se llama
   "Ventas actualizadas.xlsx" y trae 3 hojas: Sheet1 (ventas), Presupuesto,
   Acciones. Cada carga reemplaza por completo a la anterior.
-- "Inventario" (columna opcional en Sheet1) es una foto del nivel de stock:
-  se muestra el último valor reportado por marca, nunca se suma entre
-  semanas (igual criterio que Rotación).
+- "Inventario" (columna opcional en Sheet1) llega en máscara de miles de USD
+  igual que Venta y Contribución -> se multiplica x1000. Es una foto del
+  nivel de stock: se muestra el último valor reportado por marca, nunca se
+  suma entre semanas (igual criterio que Rotación).
 - "Presupuesto de contribución" (columna opcional en Sheet1) es un total por
   marca, no una serie semanal: se compara contra la Contribución real del mes
   en curso con el mismo criterio de Presupuesto vs. Real (cumplimiento,
@@ -322,10 +323,13 @@ def derive_raw(raw: pd.DataFrame) -> pd.DataFrame:
     df["Contribucion_USD"] = pd.to_numeric(df["Contribución"], errors="coerce") * 1000
     df["Clientes"] = pd.to_numeric(df["Clientes activados"], errors="coerce")
     df["Rotacion"] = pd.to_numeric(df["Rotación"], errors="coerce")
-    # Inventario: nivel de stock (no trae máscara de miles, se muestra tal cual).
-    # Presupuesto Contribucion: sí viene en miles de USD, igual que Contribución.
+    # Inventario y Presupuesto Contribucion vienen en máscara de miles de USD,
+    # igual que Venta y Contribución -> se multiplican x1000.
     # Ambas columnas son opcionales — si el archivo/CSV no las trae, quedan en NaN.
-    df["Inventario_Val"] = pd.to_numeric(df["Inventario"], errors="coerce") if "Inventario" in df.columns else np.nan
+    df["Inventario_Val"] = (
+        pd.to_numeric(df["Inventario"], errors="coerce") * 1000
+        if "Inventario" in df.columns else np.nan
+    )
     df["PresupContrib_Miles"] = (
         pd.to_numeric(df["Presupuesto Contribucion"], errors="coerce")
         if "Presupuesto Contribucion" in df.columns else np.nan
@@ -374,8 +378,9 @@ def aggregate_by_grupo(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def compute_inventario_actual(df: pd.DataFrame) -> pd.DataFrame:
-    """Último nivel de Inventario reportado por marca (foto del stock más
-    reciente; nunca se suma entre semanas, igual que Rotación nunca se suma)."""
+    """Último nivel de Inventario reportado por marca, en USD (foto del stock
+    más reciente; nunca se suma entre semanas, igual que Rotación nunca se
+    suma)."""
     if "Inventario_Val" not in df.columns or df["Inventario_Val"].notna().sum() == 0:
         return pd.DataFrame({"Marca": pd.Series(dtype="object"), "inventario": pd.Series(dtype="float64")})
     sub = df[df["Inventario_Val"].notna()].sort_values("Semana")
@@ -816,7 +821,7 @@ else:
 
     if tiene_inventario:
         k7, _, _ = st.columns(3)
-        k7.metric("Inventario actual", f"{total_inventario:,.0f}")
+        k7.metric("Inventario actual (USD)", f"${total_inventario:,.0f}")
         st.caption(
             "Inventario actual = suma del último nivel reportado por cada marca "
             "(nunca se suma entre semanas; cada marca aporta su dato más reciente)."
@@ -838,7 +843,7 @@ else:
     if tiene_inventario:
         top_inv = brand_agg[brand_agg["inventario"].notna()].nlargest(top_n, "inventario")
         st.plotly_chart(
-            hbar_chart(top_inv["Marca"], top_inv["inventario"], MUTED, fmt=fmt_num, title=f"Top {len(top_inv)} marcas por inventario (nivel más reciente)"),
+            hbar_chart(top_inv["Marca"], top_inv["inventario"], MUTED, fmt=fmt_usd, title=f"Top {len(top_inv)} marcas por inventario (USD, nivel más reciente)"),
             width='stretch',
         )
 
@@ -862,11 +867,11 @@ with st.expander("Ver tabla de datos por marca (ordenable)"):
     tabla["clientes"] = tabla["clientes"].map(lambda v: f"{v:,.0f}")
     tabla["rotacion"] = brand_agg.apply(lambda r: f"{r['rotacion']:,.1f}" if r["rot_count"] > 0 else "-", axis=1)
     tabla["inventario"] = (
-        brand_agg["inventario"].map(lambda v: f"{v:,.0f}" if pd.notna(v) else "-")
+        brand_agg["inventario"].map(lambda v: f"${v:,.0f}" if pd.notna(v) else "-")
         if "inventario" in brand_agg.columns else "-"
     )
     tabla = tabla[["Marca", "Grupo", "venta", "participacion", "contribucion", "margen", "clientes", "rotacion", "inventario"]]
-    tabla.columns = ["Marca", "Grupo", "Venta (USD)", "% Participación", "Contribución (USD)", "Margen %", "Clientes Activados", "Rotación", "Inventario"]
+    tabla.columns = ["Marca", "Grupo", "Venta (USD)", "% Participación", "Contribución (USD)", "Margen %", "Clientes Activados", "Rotación", "Inventario (USD)"]
     st.dataframe(tabla, width='stretch', hide_index=True)
 
 with st.expander("Ver rotación promedio por mes y marca (matriz)"):
@@ -924,8 +929,9 @@ st.caption(
     "en curso completo y solo incluye marcas con presupuesto asignado; \"Ritmo\" "
     "compara el % de presupuesto alcanzado contra el % de semanas ya transcurridas "
     "del mes. Las marcas sin ninguna acción registrada se muestran con la celda de "
-    'Acción vacía. "Inventario" es el último nivel reportado por marca (nunca se '
-    'suma entre semanas). "Presupuesto de Contribución" es un total por marca '
+    'Acción vacía. "Inventario" también viene en miles de USD (convertido a USD) '
+    "y es el último nivel reportado por marca (nunca se suma entre semanas). "
+    '"Presupuesto de Contribución" es un total por marca '
     "(no semanal) y se compara contra la Contribución real del mes en curso con "
     "el mismo criterio que el Presupuesto de Venta."
 )
