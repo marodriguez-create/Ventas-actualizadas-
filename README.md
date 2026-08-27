@@ -28,7 +28,8 @@ Desde la barra lateral ("Actualizar datos") se puede subir un archivo `.xlsx` co
 el mismo formato de siempre:
 
 - Hoja `Sheet1`: columnas Marca, Semana, Grupo compra, Clientes activados,
-  Contribución, Rotación, Venta Neta.
+  Contribución, Rotación, Venta Neta, y de forma opcional Inventario y
+  Presupuesto de contribución (ver más abajo).
 - Hoja `Presupuesto`: columna Marca + una columna por mes.
 - Hoja `Acciones`: columnas Marca y Acción (con celdas combinadas si una marca
   tiene varias acciones).
@@ -37,6 +38,24 @@ el mismo formato de siempre:
 contenido reemplaza por completo los datos anteriores (ventas, presupuesto y
 acciones), tal como se acordó. Si alguna hoja no se puede leer, la app avisa con
 un mensaje y conserva la información anterior de esa hoja únicamente.
+
+### Inventario y Presupuesto de Contribución
+
+Sheet1 puede traer, además de las columnas de siempre, dos columnas opcionales:
+
+- **Inventario**: se toma como una foto del nivel de stock — la app muestra el
+  último valor reportado por marca (nunca se suma entre semanas, igual criterio
+  que Rotación). Aparece como KPI, como columna en la tabla por marca y como
+  gráfico Top N en la vista KPI.
+- **Presupuesto de contribución**: es un total por marca (no una serie
+  semanal) — la app toma el último valor no vacío reportado para esa marca y
+  lo compara contra la Contribución real del mes en curso con el mismo
+  criterio que ya se usa para Presupuesto de Venta (% cumplimiento, ritmo,
+  semáforo). Aparece como una segunda sección dentro de la vista
+  "💰 Presupuesto".
+
+Si el archivo cargado no trae alguna de estas dos columnas, la app simplemente
+omite esa parte (KPI "Sin datos", sección con aviso informativo) sin romperse.
 
 A diferencia de la versión HTML, aquí el archivo se procesa en el servidor con
 Python/openpyxl (no en el navegador), así que no depende de que el navegador del

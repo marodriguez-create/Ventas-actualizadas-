@@ -21,6 +21,13 @@ construcción del dashboard:
 - El archivo recurrente que se sube para refrescar datos siempre se llama
   "Ventas actualizadas.xlsx" y trae 3 hojas: Sheet1 (ventas), Presupuesto,
   Acciones. Cada carga reemplaza por completo a la anterior.
+- "Inventario" (columna opcional en Sheet1) es una foto del nivel de stock:
+  se muestra el último valor reportado por marca, nunca se suma entre
+  semanas (igual criterio que Rotación).
+- "Presupuesto de contribución" (columna opcional en Sheet1) es un total por
+  marca, no una serie semanal: se compara contra la Contribución real del mes
+  en curso con el mismo criterio de Presupuesto vs. Real (cumplimiento,
+  ritmo, semáforo) que ya se usa para Venta.
 
 Ejecutar localmente:  streamlit run app.py
 """
@@ -156,12 +163,16 @@ def parse_ventas_sheet(ws):
                 col_map["Grupo compra"] = c
             elif vs in ("clientes activados",):
                 col_map["Clientes activados"] = c
+            elif vs.startswith("presupuesto de contribuci"):
+                col_map["Presupuesto Contribucion"] = c
             elif vs.startswith("contribuci"):
                 col_map["Contribución"] = c
             elif vs.startswith("rotaci"):
                 col_map["Rotación"] = c
             elif vs in ("venta neta", "venta real", "venta"):
                 col_map["Venta Neta"] = c
+            elif vs in ("inventario",):
+                col_map["Inventario"] = c
 
     rows = []
     for r in range(header_row + 1, ws.max_row + 1):
@@ -177,6 +188,8 @@ def parse_ventas_sheet(ws):
             "Contribución": ws.cell(row=r, column=col_map["Contribución"]).value if "Contribución" in col_map else None,
             "Rotación": ws.cell(row=r, column=col_map["Rotación"]).value if "Rotación" in col_map else None,
             "Venta Neta": ws.cell(row=r, column=col_map["Venta Neta"]).value if "Venta Neta" in col_map else None,
+            "Inventario": ws.cell(row=r, column=col_map["Inventario"]).value if "Inventario" in col_map else None,
+            "Presupuesto Contribucion": ws.cell(row=r, column=col_map["Presupuesto Contribucion"]).value if "Presupuesto Contribucion" in col_map else None,
         }
         rows.append(row)
     if not rows:
@@ -309,6 +322,14 @@ def derive_raw(raw: pd.DataFrame) -> pd.DataFrame:
     df["Contribucion_USD"] = pd.to_numeric(df["Contribución"], errors="coerce") * 1000
     df["Clientes"] = pd.to_numeric(df["Clientes activados"], errors="coerce")
     df["Rotacion"] = pd.to_numeric(df["Rotación"], errors="coerce")
+    # Inventario: nivel de stock (no trae máscara de miles, se muestra tal cual).
+    # Presupuesto Contribucion: sí viene en miles de USD, igual que Contribución.
+    # Ambas columnas son opcionales — si el archivo/CSV no las trae, quedan en NaN.
+    df["Inventario_Val"] = pd.to_numeric(df["Inventario"], errors="coerce") if "Inventario" in df.columns else np.nan
+    df["PresupContrib_Miles"] = (
+        pd.to_numeric(df["Presupuesto Contribucion"], errors="coerce")
+        if "Presupuesto Contribucion" in df.columns else np.nan
+    )
     mes_info = df["Semana"].apply(semana_a_mes)
     df["Mes"] = mes_info.apply(lambda t: t[0])
     df["Mes_Year"] = mes_info.apply(lambda t: t[1])
@@ -350,6 +371,86 @@ def aggregate_by_grupo(df: pd.DataFrame) -> pd.DataFrame:
         marcas=("Marca", "nunique"),
     )
     return g
+
+
+def compute_inventario_actual(df: pd.DataFrame) -> pd.DataFrame:
+    """Último nivel de Inventario reportado por marca (foto del stock más
+    reciente; nunca se suma entre semanas, igual que Rotación nunca se suma)."""
+    if "Inventario_Val" not in df.columns or df["Inventario_Val"].notna().sum() == 0:
+        return pd.DataFrame({"Marca": pd.Series(dtype="object"), "inventario": pd.Series(dtype="float64")})
+    sub = df[df["Inventario_Val"].notna()].sort_values("Semana")
+    out = sub.groupby("Marca", as_index=False)["Inventario_Val"].last()
+    return out.rename(columns={"Inventario_Val": "inventario"})
+
+
+def compute_contribucion_budget_comparison(df_all: pd.DataFrame, grupos_sel, marcas_sel):
+    """Presupuesto de Contribución vs. Real del mes en curso completo. A
+    diferencia del Presupuesto de Venta (que viene en su propia hoja), este
+    presupuesto llega como una columna más de Sheet1 con un único valor total
+    por marca (no una serie semanal) — se toma el último valor no vacío
+    reportado para esa marca en el mes, nunca se suma entre semanas."""
+    if df_all.empty or "PresupContrib_Miles" not in df_all.columns:
+        return None
+    if df_all["PresupContrib_Miles"].notna().sum() == 0:
+        return None
+
+    weeks_sorted = sorted(df_all["Semana"].unique())
+    mes_label, year, month = semana_a_mes(weeks_sorted[-1])
+    weeks_mes = weeks_in_month(year, month)
+    reported = [w for w in weeks_mes if w in set(df_all["Semana"])]
+    pct_avance = len(reported) / len(weeks_mes) if weeks_mes else 0
+
+    df_mes = df_all[df_all["Mes"] == mes_label]
+
+    contrib_real = (
+        df_mes.groupby("Marca", as_index=False)["Contribucion_USD"].sum()
+        .rename(columns={"Contribucion_USD": "contribucion_real"})
+    )
+
+    # El presupuesto de contribución es un total por marca, no una cifra
+    # semanal: se busca en TODAS las semanas cargadas (no solo el mes en
+    # curso), porque el archivo puede etiquetarlo en cualquier semana del
+    # rango exportado (p. ej. la primera), incluso si esa semana cae en un
+    # mes distinto al mes en curso según la regla ISO del jueves.
+    presu_rows = df_all[df_all["PresupContrib_Miles"].notna()].sort_values("Semana")
+    if presu_rows.empty:
+        return None
+    presu_contrib = presu_rows.groupby("Marca", as_index=False)["PresupContrib_Miles"].last()
+    presu_contrib["presupuesto_contrib"] = presu_contrib["PresupContrib_Miles"] * 1000
+
+    marca_grupo = df_all.drop_duplicates("Marca").set_index("Marca")["Grupo"]
+    presu_contrib["Grupo"] = presu_contrib["Marca"].map(marca_grupo)
+    presu_contrib = presu_contrib[
+        presu_contrib["Marca"].isin(marcas_sel) & presu_contrib["Grupo"].isin(grupos_sel)
+    ]
+    if presu_contrib.empty:
+        return None
+
+    rows = presu_contrib.merge(contrib_real, on="Marca", how="left")
+    rows["contribucion_real"] = rows["contribucion_real"].fillna(0)
+    rows["cumplimiento"] = np.where(
+        rows["presupuesto_contrib"] != 0, rows["contribucion_real"] / rows["presupuesto_contrib"], np.nan
+    )
+    rows["ritmo"] = rows["cumplimiento"] / pct_avance if pct_avance > 0 else np.nan
+    rows["estado"] = rows["ritmo"].apply(estado_ritmo)
+    rows = rows[["Marca", "Grupo", "presupuesto_contrib", "contribucion_real", "cumplimiento", "ritmo", "estado"]]
+
+    total_presu = rows["presupuesto_contrib"].sum()
+    total_real = rows["contribucion_real"].sum()
+    total_cumpl = total_real / total_presu if total_presu else 0
+    total_ritmo = total_cumpl / pct_avance if pct_avance > 0 else 0
+
+    return {
+        "mes_label": mes_label,
+        "weeks_mes": weeks_mes,
+        "reported": reported,
+        "pct_avance": pct_avance,
+        "rows": rows.sort_values("presupuesto_contrib", ascending=False).reset_index(drop=True),
+        "total_presu": total_presu,
+        "total_real": total_real,
+        "total_cumpl": total_cumpl,
+        "total_ritmo": total_ritmo,
+    }
 
 
 def compute_budget_comparison(df_all: pd.DataFrame, presu: pd.DataFrame, grupos_sel, marcas_sel):
@@ -522,14 +623,15 @@ if "raw" not in st.session_state:
     st.session_state.raw = raw0
     st.session_state.presu = presu0
     st.session_state.acciones_hits = acciones0
-    st.session_state.data_label = "data 100.xlsx (datos de ejemplo incluidos)"
+    st.session_state.data_label = "Ventas actualizadas.xlsx (datos incluidos por defecto)"
 
 with st.sidebar:
     st.header("📤 Actualizar datos")
     st.caption(
         'Sube el archivo recurrente **"Ventas actualizadas.xlsx"** '
         '(hojas Sheet1, Presupuesto y Acciones). Reemplaza por completo '
-        'los datos actuales.'
+        'los datos actuales. Sheet1 puede incluir además las columnas '
+        'opcionales "Inventario" y "Presupuesto de contribución".'
     )
     uploaded = st.file_uploader("Archivo .xlsx", type=["xlsx"], label_visibility="collapsed")
     if uploaded is not None:
@@ -595,6 +697,10 @@ df_for_budget = raw[raw["Grupo"].isin(grupos_sel) & raw["Marca"].isin(brands_sel
 brand_agg = aggregate_by_brand(df_filtered)
 week_agg = aggregate_by_week(df_filtered)
 grupo_agg = aggregate_by_grupo(df_filtered)
+# Inventario es una foto del nivel actual: se calcula sobre Grupo+Marca
+# filtrados pero ignorando el filtro de Semana (igual criterio que
+# Presupuesto vs. Real), y se agrega a la tabla por marca.
+brand_agg = brand_agg.merge(compute_inventario_actual(df_for_budget), on="Marca", how="left")
 
 # ----------------------------------------------------------------------
 # Selector de vista: Presupuesto / KPI
@@ -606,7 +712,7 @@ if view is None:
     view = "💰 Presupuesto"
 
 if view == "💰 Presupuesto":
-    st.subheader("Presupuesto vs. Real")
+    st.subheader("Presupuesto de Venta vs. Real")
     budget = compute_budget_comparison(df_for_budget, presu, grupos_sel, brands_sel)
     if budget is None:
         st.info(
@@ -645,6 +751,48 @@ if view == "💰 Presupuesto":
             tabla.columns = ["Marca", "Grupo", "Presupuesto (USD)", "Venta Real (USD)", "% Cumplimiento", "Ritmo vs. calendario", "Estado"]
             st.dataframe(tabla, width='stretch', hide_index=True)
 
+    st.divider()
+    st.subheader("Presupuesto de Contribución vs. Real")
+    budget_c = compute_contribucion_budget_comparison(df_for_budget, grupos_sel, brands_sel)
+    if budget_c is None:
+        st.info(
+            "No hay marcas con presupuesto de contribución asignado para los filtros "
+            'seleccionados, o el archivo cargado no trae la columna "Presupuesto de '
+            'contribución" en Sheet1.'
+        )
+    else:
+        st.caption(
+            f"Mes en curso: **{budget_c['mes_label']}** — mismo criterio que el "
+            "presupuesto de venta: compara siempre el mes completo (no responde al "
+            "filtro de Semana), pero sí a Grupo de Compra y Marca. El presupuesto de "
+            "contribución es un total por marca (no una serie semanal), así que nunca "
+            "se suma entre semanas."
+        )
+        d1, d2, d3, d4, d5 = st.columns(5)
+        d1.metric(f"Presup. Contribución {budget_c['mes_label']} (USD)", f"${budget_c['total_presu']:,.0f}")
+        d2.metric(f"Contribución Real {budget_c['mes_label']} (USD)", f"${budget_c['total_real']:,.0f}")
+        d3.metric("% Cumplimiento presupuesto", f"{budget_c['total_cumpl']:.1%}")
+        d4.metric("Avance del mes (semanas)", f"{budget_c['pct_avance']:.1%}")
+        d5.metric("Ritmo vs. calendario", f"{budget_c['total_ritmo']:.1%}")
+
+        rows_sorted_c = budget_c["rows"].sort_values("cumplimiento", ascending=True)
+        st.plotly_chart(
+            hbar_chart(
+                rows_sorted_c["Marca"], rows_sorted_c["cumplimiento"], VIOLET,
+                fmt=fmt_pct, title="% Cumplimiento de presupuesto de contribución por marca (mes en curso)",
+            ),
+            width='stretch',
+        )
+
+        with st.expander("Ver tabla de presupuesto de contribución por marca"):
+            tabla_c = budget_c["rows"].copy()
+            tabla_c["presupuesto_contrib"] = tabla_c["presupuesto_contrib"].map(lambda v: f"${v:,.0f}")
+            tabla_c["contribucion_real"] = tabla_c["contribucion_real"].map(lambda v: f"${v:,.0f}")
+            tabla_c["cumplimiento"] = tabla_c["cumplimiento"].map(lambda v: f"{v:.1%}" if pd.notna(v) else "-")
+            tabla_c["ritmo"] = tabla_c["ritmo"].map(lambda v: f"{v:.1%}" if pd.notna(v) else "-")
+            tabla_c.columns = ["Marca", "Grupo", "Presupuesto Contribución (USD)", "Contribución Real (USD)", "% Cumplimiento", "Ritmo vs. calendario", "Estado"]
+            st.dataframe(tabla_c, width='stretch', hide_index=True)
+
 else:
     st.subheader("Indicadores y KPI")
     total_venta = brand_agg["venta"].sum()
@@ -655,6 +803,9 @@ else:
     top3 = brand_agg.nlargest(3, "venta")["venta"].sum()
     conc = top3 / total_venta if total_venta else 0
 
+    tiene_inventario = "inventario" in brand_agg.columns and brand_agg["inventario"].notna().any()
+    total_inventario = brand_agg["inventario"].sum(skipna=True) if tiene_inventario else 0
+
     k1, k2, k3, k4, k5, k6 = st.columns(6)
     k1.metric("Venta total (USD)", f"${total_venta:,.0f}")
     k2.metric("Contribución total (USD)", f"${total_contrib:,.0f}")
@@ -662,6 +813,14 @@ else:
     k4.metric("Clientes activados", f"{total_clientes:,.0f}")
     k5.metric("Marcas activas", f"{marcas_activas} / {len(brand_agg)}")
     k6.metric("Concentración Top 3 marcas", f"{conc:.1%}")
+
+    if tiene_inventario:
+        k7, _, _ = st.columns(3)
+        k7.metric("Inventario actual", f"{total_inventario:,.0f}")
+        st.caption(
+            "Inventario actual = suma del último nivel reportado por cada marca "
+            "(nunca se suma entre semanas; cada marca aporta su dato más reciente)."
+        )
 
     top_venta = brand_agg.nlargest(top_n, "venta")
     top_contrib = brand_agg.nlargest(top_n, "contribucion")
@@ -675,6 +834,13 @@ else:
     with cc2:
         st.plotly_chart(hbar_chart(top_contrib["Marca"], top_contrib["contribucion"], ORANGE, title=f"Top {len(top_contrib)} marcas por contribución (USD)"), width='stretch')
         st.plotly_chart(hbar_chart(top_rot["Marca"], top_rot["rotacion"], RED, fmt=fmt_num1, title=f"Top {len(top_rot)} marcas por índice de rotación"), width='stretch')
+
+    if tiene_inventario:
+        top_inv = brand_agg[brand_agg["inventario"].notna()].nlargest(top_n, "inventario")
+        st.plotly_chart(
+            hbar_chart(top_inv["Marca"], top_inv["inventario"], MUTED, fmt=fmt_num, title=f"Top {len(top_inv)} marcas por inventario (nivel más reciente)"),
+            width='stretch',
+        )
 
     cc3, cc4 = st.columns(2)
     with cc3:
@@ -695,8 +861,12 @@ with st.expander("Ver tabla de datos por marca (ordenable)"):
     tabla["margen"] = tabla["margen"].map(lambda v: f"{v:.1%}")
     tabla["clientes"] = tabla["clientes"].map(lambda v: f"{v:,.0f}")
     tabla["rotacion"] = brand_agg.apply(lambda r: f"{r['rotacion']:,.1f}" if r["rot_count"] > 0 else "-", axis=1)
-    tabla = tabla[["Marca", "Grupo", "venta", "participacion", "contribucion", "margen", "clientes", "rotacion"]]
-    tabla.columns = ["Marca", "Grupo", "Venta (USD)", "% Participación", "Contribución (USD)", "Margen %", "Clientes Activados", "Rotación"]
+    tabla["inventario"] = (
+        brand_agg["inventario"].map(lambda v: f"{v:,.0f}" if pd.notna(v) else "-")
+        if "inventario" in brand_agg.columns else "-"
+    )
+    tabla = tabla[["Marca", "Grupo", "venta", "participacion", "contribucion", "margen", "clientes", "rotacion", "inventario"]]
+    tabla.columns = ["Marca", "Grupo", "Venta (USD)", "% Participación", "Contribución (USD)", "Margen %", "Clientes Activados", "Rotación", "Inventario"]
     st.dataframe(tabla, width='stretch', hide_index=True)
 
 with st.expander("Ver rotación promedio por mes y marca (matriz)"):
@@ -754,5 +924,8 @@ st.caption(
     "en curso completo y solo incluye marcas con presupuesto asignado; \"Ritmo\" "
     "compara el % de presupuesto alcanzado contra el % de semanas ya transcurridas "
     "del mes. Las marcas sin ninguna acción registrada se muestran con la celda de "
-    "Acción vacía."
+    'Acción vacía. "Inventario" es el último nivel reportado por marca (nunca se '
+    'suma entre semanas). "Presupuesto de Contribución" es un total por marca '
+    "(no semanal) y se compara contra la Contribución real del mes en curso con "
+    "el mismo criterio que el Presupuesto de Venta."
 )
