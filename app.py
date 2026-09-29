@@ -94,7 +94,8 @@ def weeks_in_month(year: int, month: int):
 
 
 def mes_en_curso(df_all: pd.DataFrame):
-    """Determina el mes en curso para los comparativos de Presupuesto.
+    """Determina el mes en curso y sus semanas para los comparativos de
+    Presupuesto. Devuelve (mes_label, year, month, weeks_mes).
 
     Antes se tomaba siempre el mes (regla ISO del jueves) de la ÚLTIMA semana
     cargada. Eso falla justo en el cambio de mes: la semana que arranca a
@@ -107,18 +108,33 @@ def mes_en_curso(df_all: pd.DataFrame):
     Regla corregida: el mes en curso es el mes calendario REAL de hoy. Si los
     datos cargados todavía no llegan a ese mes (por ejemplo, se está viendo un
     archivo histórico/de prueba de meses anteriores), se usa como respaldo el
-    mes de la última semana cargada, para no dejar el dashboard vacío."""
+    mes de la última semana cargada, para no dejar el dashboard vacío.
+
+    Además, la semana que contiene la fecha de HOY se cuenta siempre dentro
+    de las semanas del mes en curso para efectos de Presupuesto/Ritmo, aunque
+    su jueves (regla ISO) caiga técnicamente en el mes siguiente: mientras se
+    esté viviendo esa semana, sus ventas pertenecen al mes en curso — es la
+    misma semana "bisagra" del caso anterior."""
     hoy = datetime.date.today()
     mes_label = f"{MESES_ES[hoy.month - 1]} {hoy.year}"
     year, month = hoy.year, hoy.month
+    usando_hoy = True
 
     if df_all is not None and not df_all.empty:
         weeks_sorted = sorted(df_all["Semana"].unique())
         _, ult_year, ult_month = semana_a_mes(weeks_sorted[-1])
         if (ult_year, ult_month) < (year, month):
             mes_label, year, month = semana_a_mes(weeks_sorted[-1])
+            usando_hoy = False
 
-    return mes_label, year, month
+    weeks_mes = weeks_in_month(year, month)
+    if usando_hoy:
+        iso_year, iso_week, _ = hoy.isocalendar()
+        semana_hoy = f"{iso_year}-{iso_week:02d}"
+        if semana_hoy not in weeks_mes:
+            weeks_mes = sorted(weeks_mes + [semana_hoy])
+
+    return mes_label, year, month, weeks_mes
 
 
 def estado_ritmo(ritmo):
@@ -427,12 +443,15 @@ def compute_contribucion_budget_comparison(df_all: pd.DataFrame, grupos_sel, mar
     if df_all["PresupContrib_Miles"].notna().sum() == 0:
         return None
 
-    mes_label, year, month = mes_en_curso(df_all)
-    weeks_mes = weeks_in_month(year, month)
+    mes_label, year, month, weeks_mes = mes_en_curso(df_all)
     reported = [w for w in weeks_mes if w in set(df_all["Semana"])]
     pct_avance = len(reported) / len(weeks_mes) if weeks_mes else 0
 
-    df_mes = df_all[df_all["Mes"] == mes_label]
+    # Se filtra por la lista de semanas del mes en curso (weeks_mes), no por
+    # la etiqueta "Mes" de cada fila: así la semana "bisagra" que hoy cuenta
+    # como parte del mes en curso se incluye aunque su jueves (regla ISO)
+    # caiga en el mes siguiente.
+    df_mes = df_all[df_all["Semana"].isin(weeks_mes)]
 
     contrib_real = (
         df_mes.groupby("Marca", as_index=False)["Contribucion_USD"].sum()
@@ -491,13 +510,16 @@ def compute_budget_comparison(df_all: pd.DataFrame, presu: pd.DataFrame, grupos_
     if df_all.empty or presu is None or presu.empty:
         return None
 
-    mes_label, year, month = mes_en_curso(df_all)
-    weeks_mes = weeks_in_month(year, month)
+    mes_label, year, month, weeks_mes = mes_en_curso(df_all)
     reported = [w for w in weeks_mes if w in set(df_all["Semana"])]
     pct_avance = len(reported) / len(weeks_mes) if weeks_mes else 0
 
+    # Igual que en Presupuesto de Contribución: se filtra por la lista de
+    # semanas del mes en curso (weeks_mes), no por la etiqueta "Mes" de cada
+    # fila, para incluir la semana "bisagra" de hoy aunque su jueves caiga en
+    # el mes siguiente.
     venta_mes = (
-        df_all[df_all["Mes"] == mes_label]
+        df_all[df_all["Semana"].isin(weeks_mes)]
         .groupby("Marca", as_index=False)["Venta_USD"].sum()
         .rename(columns={"Venta_USD": "venta_real"})
     )
@@ -541,7 +563,7 @@ def order_acciones_by_budget(acciones_full: pd.DataFrame, presu: pd.DataFrame, d
     curso; las marcas sin presupuesto quedan al final, en orden alfabético."""
     budget_map = {}
     if presu is not None and not presu.empty and not df_all.empty:
-        _, year, month = mes_en_curso(df_all)
+        _, year, month, _ = mes_en_curso(df_all)
         presu_mes = presu[presu["Mes_Fecha"].dt.to_period("M") == pd.Timestamp(year=year, month=month, day=1).to_period("M")]
         budget_map = dict(zip(presu_mes["Marca"], presu_mes["Presupuesto_Miles"] * 1000))
 
