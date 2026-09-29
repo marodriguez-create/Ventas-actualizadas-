@@ -93,6 +93,34 @@ def weeks_in_month(year: int, month: int):
     return out
 
 
+def mes_en_curso(df_all: pd.DataFrame):
+    """Determina el mes en curso para los comparativos de Presupuesto.
+
+    Antes se tomaba siempre el mes (regla ISO del jueves) de la ÚLTIMA semana
+    cargada. Eso falla justo en el cambio de mes: la semana que arranca a
+    fines de septiembre (p. ej. "2026-40", lunes 28-sep a domingo 4-oct) tiene
+    su jueves ya en octubre, así que esa sola semana hacía que TODO el
+    dashboard saltara a "Octubre" aunque hoy realmente sea todavía septiembre
+    y las demás semanas cargadas sean de septiembre — de ahí el reporte de
+    "me lee solo octubre".
+
+    Regla corregida: el mes en curso es el mes calendario REAL de hoy. Si los
+    datos cargados todavía no llegan a ese mes (por ejemplo, se está viendo un
+    archivo histórico/de prueba de meses anteriores), se usa como respaldo el
+    mes de la última semana cargada, para no dejar el dashboard vacío."""
+    hoy = datetime.date.today()
+    mes_label = f"{MESES_ES[hoy.month - 1]} {hoy.year}"
+    year, month = hoy.year, hoy.month
+
+    if df_all is not None and not df_all.empty:
+        weeks_sorted = sorted(df_all["Semana"].unique())
+        _, ult_year, ult_month = semana_a_mes(weeks_sorted[-1])
+        if (ult_year, ult_month) < (year, month):
+            mes_label, year, month = semana_a_mes(weeks_sorted[-1])
+
+    return mes_label, year, month
+
+
 def estado_ritmo(ritmo):
     if ritmo is None or pd.isna(ritmo):
         return "Sin presupuesto asignado"
@@ -399,8 +427,7 @@ def compute_contribucion_budget_comparison(df_all: pd.DataFrame, grupos_sel, mar
     if df_all["PresupContrib_Miles"].notna().sum() == 0:
         return None
 
-    weeks_sorted = sorted(df_all["Semana"].unique())
-    mes_label, year, month = semana_a_mes(weeks_sorted[-1])
+    mes_label, year, month = mes_en_curso(df_all)
     weeks_mes = weeks_in_month(year, month)
     reported = [w for w in weeks_mes if w in set(df_all["Semana"])]
     pct_avance = len(reported) / len(weeks_mes) if weeks_mes else 0
@@ -464,8 +491,7 @@ def compute_budget_comparison(df_all: pd.DataFrame, presu: pd.DataFrame, grupos_
     if df_all.empty or presu is None or presu.empty:
         return None
 
-    weeks_sorted = sorted(df_all["Semana"].unique())
-    mes_label, year, month = semana_a_mes(weeks_sorted[-1])
+    mes_label, year, month = mes_en_curso(df_all)
     weeks_mes = weeks_in_month(year, month)
     reported = [w for w in weeks_mes if w in set(df_all["Semana"])]
     pct_avance = len(reported) / len(weeks_mes) if weeks_mes else 0
@@ -515,8 +541,7 @@ def order_acciones_by_budget(acciones_full: pd.DataFrame, presu: pd.DataFrame, d
     curso; las marcas sin presupuesto quedan al final, en orden alfabético."""
     budget_map = {}
     if presu is not None and not presu.empty and not df_all.empty:
-        weeks_sorted = sorted(df_all["Semana"].unique())
-        _, year, month = semana_a_mes(weeks_sorted[-1])
+        _, year, month = mes_en_curso(df_all)
         presu_mes = presu[presu["Mes_Fecha"].dt.to_period("M") == pd.Timestamp(year=year, month=month, day=1).to_period("M")]
         budget_map = dict(zip(presu_mes["Marca"], presu_mes["Presupuesto_Miles"] * 1000))
 
