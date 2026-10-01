@@ -628,7 +628,8 @@ def aggregate_by_grupo(df: pd.DataFrame) -> pd.DataFrame:
 
 def kpi_por_region_tabla(
     df_region: pd.DataFrame, df_region_budget: pd.DataFrame, region_sel,
-    all_weeks=None, meses_sel=None, venta_mensual_lookup=None, semana_filtro_es_mes_completo: bool = False,
+    all_weeks=None, meses_sel=None, venta_mensual_lookup=None,
+    semana_filtro_es_mes_completo: bool = False, region_es_todas: bool = False,
 ) -> pd.DataFrame:
     """Una fila por Región (de las seleccionadas) con los mismos indicadores
     que las tarjetas de KPI: Venta, Contribución, Margen de contribución,
@@ -639,36 +640,63 @@ def kpi_por_region_tabla(
     el mismo número repetido en cada fila, dando la impresión equivocada de
     que cada Región tiene su propio inventario independiente.
 
-    La Venta de cada Región usa el mismo resguardo de la semana "bisagra"
-    que el total general: si el filtro de Semana cubre el mes completo y
-    Sheet2 todavía no confirma ese Marca+Mes, la semana bisagra se excluye.
-    A diferencia del total general, aquí NUNCA se sustituye por el total de
-    Sheet2 (ese total es de todas las Regiones juntas, no de una sola), así
-    que ninguna fila de Región puede mostrar, por sí sola, el total del mes
-    completo."""
+    La Venta de cada Región, por Marca:
+    - Si `region_es_todas` (están seleccionadas las 4 Regiones) y Sheet2 ya
+      confirma ese Marca+Mes: se toma el total EXACTO de Sheet2 (el mismo
+      que usa el total combinado de arriba) y se reparte entre las Regiones
+      en proporción a cuánto vendió cada una esa Marca en las semanas
+      cargadas — así la suma de las filas coincide con el total de arriba.
+      El reparto de la semana "bisagra" entre Regiones es una ESTIMACIÓN
+      proporcional (Sheet2 no trae ese desglose), pero el TOTAL sí es exacto.
+    - Si se seleccionó solo un subconjunto de Regiones (Sheet2 no sirve para
+      aislar un subconjunto), o Sheet2 todavía no confirma ese Marca+Mes: se
+      excluye la semana bisagra hasta poder confirmarla, igual que el total
+      combinado hace en ese mismo caso."""
+    marcas_presentes = sorted(df_region["Marca"].unique())
+    venta_cruda = df_region.groupby(["Marca", "Región"])["Venta_USD"].sum()
+
+    # venta_asignada[región][marca] = venta ya repartida/corregida
+    venta_asignada = {region: {} for region in region_sel}
+    for marca in marcas_presentes:
+        cruda_por_region = {r: venta_cruda.get((marca, r), 0.0) for r in region_sel}
+        cruda_total = sum(cruda_por_region.values())
+
+        if semana_filtro_es_mes_completo and meses_sel:
+            objetivo = sum(
+                venta_real_marca_mes(
+                    df_region_budget, venta_mensual_lookup or {}, all_weeks or [], marca, y, m,
+                    usar_sheet2=region_es_todas,
+                )
+                for (y, m) in meses_sel
+            )
+        else:
+            objetivo = cruda_total
+
+        if cruda_total > 0:
+            for r in region_sel:
+                venta_asignada[r][marca] = objetivo * (cruda_por_region[r] / cruda_total)
+        elif objetivo:
+            # Sin venta cruda cargada para ninguna Región (caso raro) pero
+            # Sheet2 sí reporta algo: se reparte en partes iguales.
+            parte = objetivo / len(region_sel)
+            for r in region_sel:
+                venta_asignada[r][marca] = parte
+        else:
+            for r in region_sel:
+                venta_asignada[r][marca] = 0.0
+
     filas = []
     for region in region_sel:
         df_r = df_region[df_region["Región"] == region]
         brand_agg_r = aggregate_by_brand(df_r)
-        # Mismo resguardo de semana "bisagra" que el total general, pero
-        # aplicado por Marca ANTES de calcular Top 3 / Marcas activas, para
-        # que esos indicadores sean consistentes con el total de Venta de la
-        # fila (si no, el Top 3 podía sumar más que el total y dar una
-        # "Concentración" por encima de 100%).
-        if semana_filtro_es_mes_completo and meses_sel and not brand_agg_r.empty:
-            df_rb = df_region_budget[df_region_budget["Región"] == region]
-            venta_dict_r = venta_real_por_marca(
-                df_rb, venta_mensual_lookup or {}, all_weeks or [], brand_agg_r["Marca"], meses_sel, usar_sheet2=False,
-            )
-            brand_agg_r = brand_agg_r.copy()
-            brand_agg_r["venta"] = brand_agg_r["Marca"].map(venta_dict_r).fillna(brand_agg_r["venta"])
-        venta = brand_agg_r["venta"].sum()
         contrib = brand_agg_r["contribucion"].sum()
-        margen = contrib / venta if venta else 0
         clientes = brand_agg_r["clientes"].sum()
-        marcas_activas = int((brand_agg_r["venta"] > 0).sum())
+        venta_por_marca_r = venta_asignada[region]
+        venta = sum(venta_por_marca_r.values())
+        margen = contrib / venta if venta else 0
         marcas_total = len(brand_agg_r)
-        top3 = brand_agg_r.nlargest(3, "venta")["venta"].sum() if not brand_agg_r.empty else 0
+        marcas_activas = sum(1 for v in venta_por_marca_r.values() if v > 0)
+        top3 = sum(sorted(venta_por_marca_r.values(), reverse=True)[:3])
         concentracion = top3 / venta if venta else 0
         filas.append({
             "Región": region, "venta": venta, "contribucion": contrib, "margen": margen,
@@ -985,7 +1013,7 @@ def vbar_chart(labels, values, color, fmt=fmt_num, title=None):
     return fig
 
 
-def render_kpi_view(brand_agg: pd.DataFrame, week_agg: pd.DataFrame, grupo_agg: pd.DataFrame, top_n: int, region_breakdown: pd.DataFrame = None, week_region_agg: pd.DataFrame = None):
+def render_kpi_view(brand_agg: pd.DataFrame, week_agg: pd.DataFrame, grupo_agg: pd.DataFrame, top_n: int, region_breakdown: pd.DataFrame = None, week_region_agg: pd.DataFrame = None, region_es_todas: bool = False):
     """Tarjetas KPI + gráficos Top-N + evolución semanal + venta por grupo.
     Se reutiliza tanto en la vista '📈 KPI' (todas las Regiones) como en
     '🗺️ KPI por Región' (Región(es) seleccionada(s)); solo cambian las
@@ -994,7 +1022,8 @@ def render_kpi_view(brand_agg: pd.DataFrame, week_agg: pd.DataFrame, grupo_agg: 
     cada Región seleccionada, debajo de las tarjetas de totales.
     `week_region_agg` (opcional, solo en la vista por Región) agrega un
     gráfico de evolución semanal con una línea por Región, para comparar su
-    avance semana a semana (no solo el total agregado del mes)."""
+    avance semana a semana (no solo el total agregado del mes). `region_es_todas`
+    solo afecta el texto de la nota bajo la tabla por Región (ver abajo)."""
     total_venta = brand_agg["venta"].sum()
     total_contrib = brand_agg["contribucion"].sum()
     margen = total_contrib / total_venta if total_venta else 0
@@ -1034,14 +1063,6 @@ def render_kpi_view(brand_agg: pd.DataFrame, week_agg: pd.DataFrame, grupo_agg: 
         tabla_r = tabla_r[cols]
         tabla_r.columns = nombres
         st.dataframe(tabla_r, width='stretch', hide_index=True)
-        st.caption(
-            "La Venta de cada Región usa el mismo resguardo de la semana \"bisagra\" que el "
-            "total de arriba, pero nunca se sustituye por el total de Sheet2 (ese total es de "
-            "todas las Regiones juntas, no de una sola), así que ninguna fila por sí sola refleja "
-            "el total exacto del mes — para eso está el total combinado de arriba. No se incluye "
-            "Inventario porque en el archivo llega como un dato único por Marca+Semana (no por "
-            "Región), igual que Rotación."
-        )
 
     if brand_agg.empty:
         st.info("No hay datos para los filtros seleccionados.")
@@ -1386,12 +1407,12 @@ else:
         region_breakdown = kpi_por_region_tabla(
             df_region, df_region_budget, region_sel,
             all_weeks=ALL_WEEKS, meses_sel=meses_sel, venta_mensual_lookup=VENTA_MENSUAL_LOOKUP,
-            semana_filtro_es_mes_completo=semana_filtro_es_mes_completo,
+            semana_filtro_es_mes_completo=semana_filtro_es_mes_completo, region_es_todas=region_es_todas,
         )
         week_region_agg = aggregate_by_week_region(df_region)
         render_kpi_view(
             brand_agg_region, week_agg_region, grupo_agg_region, top_n,
-            region_breakdown=region_breakdown, week_region_agg=week_region_agg,
+            region_breakdown=region_breakdown, week_region_agg=week_region_agg, region_es_todas=region_es_todas,
         )
 
 # ----------------------------------------------------------------------
