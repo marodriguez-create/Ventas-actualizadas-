@@ -43,15 +43,20 @@ construcción del dashboard:
   como la calcula el sistema de origen (columnas Marca + una columna de mes
   tipo "8-2026" + "Venta Neta"). Se usa para corregir el monto de "Venta" de
   cualquier semana "bisagra" compartida entre dos meses: en vez de contar esa
-  semana completa en el mes que se elija (regla anterior), se usa
-  directamente el total de Sheet2 de ese Marca+Mes — así, la misma semana
-  bisagra aporta un monto distinto al filtrar Agosto que al filtrar
-  Septiembre, cada uno con su propio total oficial. Si Sheet2 no trae un
-  Marca+Mes (archivo sin esa hoja, o mes sin dato todavía), se usa de
-  respaldo la regla anterior. Esta corrección solo aplica a "Venta" (no a
-  Contribución, Clientes ni Rotación) y solo cuando el filtro de Semana no
-  recorta manualmente el mes completo; no aplica en la vista "KPI por
-  Región" (Sheet2 no trae desglose regional).
+  semana completa en el mes que se elija, se usa directamente el total de
+  Sheet2 de ese Marca+Mes — así, la misma semana bisagra aporta un monto
+  distinto al filtrar Agosto que al filtrar Septiembre, cada uno con su
+  propio total oficial. Si Sheet2 no trae un Marca+Mes (archivo sin esa hoja,
+  o mes sin dato todavía), NO se cuenta ninguna semana "bisagra" de ese mes
+  (se suman solo las semanas cargadas que tocan EXCLUSIVAMENTE ese mes) hasta
+  que Sheet2 confirme cuánto le corresponde a cada mes — así un mes sin datos
+  cargados todavía no muestra Venta Real solo porque su semana bisagra con el
+  mes anterior ya está cargada. Esta corrección solo aplica a "Venta" (no a
+  Contribución, Clientes ni Rotación). En la vista "KPI por Región" se aplica
+  igual, con una salvedad: el total de Sheet2 (que no trae desglose regional)
+  solo se usa cuando están seleccionadas TODAS las Regiones; si se filtra a
+  un subconjunto de Regiones, igual se excluye la semana bisagra no
+  confirmada, aunque sin la precisión exacta de Sheet2 para ese subconjunto.
 
 Ejecutar localmente:  streamlit run app.py
 """
@@ -178,41 +183,52 @@ def mes_en_curso_default(all_weeks):
     return year, month
 
 
-def venta_real_marca_mes(df_all: pd.DataFrame, venta_mensual_lookup: dict, all_weeks, marca: str, year: int, month: int):
+def venta_real_marca_mes(df_all: pd.DataFrame, venta_mensual_lookup: dict, all_weeks, marca: str, year: int, month: int, usar_sheet2: bool = True):
     """Venta real de una Marca para un mes calendario completo (year, month).
 
     Si la hoja "Sheet2" (venta completa por Marca y Mes, tal como la calcula
-    el sistema de origen) trae el dato de esa Marca+Mes, se usa DIRECTAMENTE
-    — ya es el total correcto del mes completo, incluyendo automáticamente
-    la porción que le corresponde de cualquier semana "bisagra" compartida
-    con el mes vecino (equivale a restarle a ese total las semanas que no
-    chocan, como pidió María Antonieta, pero sin tener que aislar cada
-    semana bisagra una por una: la resta y el total dan el mismo resultado).
-    Por eso una misma semana bisagra puede aportar un monto distinto según
-    se esté mirando Agosto o Septiembre — cada mes usa su propio total de
-    Sheet2.
+    el sistema de origen) trae el dato de esa Marca+Mes Y `usar_sheet2` es
+    True, se usa DIRECTAMENTE — ya es el total correcto del mes completo,
+    incluyendo automáticamente la porción que le corresponde de cualquier
+    semana "bisagra" compartida con el mes vecino (equivale a restarle a ese
+    total las semanas que no chocan, como pidió María Antonieta, pero sin
+    tener que aislar cada semana bisagra una por una: la resta y el total
+    dan el mismo resultado). Por eso una misma semana bisagra puede aportar
+    un monto distinto según se esté mirando Agosto o Septiembre — cada mes
+    usa su propio total de Sheet2.
 
-    Si Sheet2 no trae esa Marca+Mes (p. ej. todavía no se subió, o es un mes
-    futuro), se usa como respaldo la regla anterior: sumar "Venta_USD" de
-    todas las semanas cargadas que tocan ese mes (la semana bisagra se
-    cuenta completa, una sola vez)."""
+    `usar_sheet2=False` se usa cuando `df_all` ya viene filtrado a un
+    subconjunto (p. ej. una o varias Región(es) específicas) para el que
+    Sheet2 no tiene desglose: el total de Sheet2 es de TODAS las regiones
+    juntas, así que aplicarlo a un subconjunto de regiones daría un número
+    incorrecto. En ese caso (o cuando Sheet2 simplemente no trae esa
+    Marca+Mes) se suman únicamente las semanas cargadas que tocan
+    EXCLUSIVAMENTE ese mes (sin compartirlo con el mes vecino); cualquier
+    semana "bisagra" se deja afuera hasta que se pueda confirmar cuánto le
+    corresponde a cada mes, en vez de contarla completa como antes — así,
+    por ejemplo, Octubre no muestra como "Venta Real" la semana 2026-40 (que
+    es mayormente de Septiembre) solo porque esa semana ya está cargada."""
     key = (marca, year, month)
-    if venta_mensual_lookup and key in venta_mensual_lookup:
+    if usar_sheet2 and venta_mensual_lookup and key in venta_mensual_lookup:
         return venta_mensual_lookup[key]
-    weeks_mes = weeks_for_meses(all_weeks, [(year, month)])
-    sub = df_all[(df_all["Marca"] == marca) & (df_all["Semana"].isin(weeks_mes))]
+    weeks_mes_exclusivas = [
+        w for w in weeks_for_meses(all_weeks, [(year, month)])
+        if meses_tocados_por_semana(w) == {(year, month)}
+    ]
+    sub = df_all[(df_all["Marca"] == marca) & (df_all["Semana"].isin(weeks_mes_exclusivas))]
     return sub["Venta_USD"].sum()
 
 
-def venta_real_por_marca(df_all: pd.DataFrame, venta_mensual_lookup: dict, all_weeks, marcas, meses_sel) -> dict:
+def venta_real_por_marca(df_all: pd.DataFrame, venta_mensual_lookup: dict, all_weeks, marcas, meses_sel, usar_sheet2: bool = True) -> dict:
     """{Marca: venta_real} sumando `venta_real_marca_mes` sobre todos los
     meses seleccionados (si se eligieron varios meses, se suman sus
     totales — cada mes de Sheet2 ya es una porción exclusiva, así que no hay
     riesgo de contar dos veces una semana bisagra compartida entre dos meses
-    que estén AMBOS seleccionados)."""
+    que estén AMBOS seleccionados). Ver `venta_real_marca_mes` para el uso
+    de `usar_sheet2`."""
     return {
         marca: sum(
-            venta_real_marca_mes(df_all, venta_mensual_lookup, all_weeks, marca, y, m)
+            venta_real_marca_mes(df_all, venta_mensual_lookup, all_weeks, marca, y, m, usar_sheet2=usar_sheet2)
             for (y, m) in meses_sel
         )
         for marca in marcas
@@ -701,18 +717,35 @@ def compute_budget_comparison(df_all: pd.DataFrame, presu: pd.DataFrame, grupos_
     if df_all.empty or presu is None or presu.empty or not weeks_mes:
         return None
 
-    reported = [w for w in weeks_mes if w in set(df_all["Semana"])]
-    pct_avance = len(reported) / len(weeks_mes) if weeks_mes else 0
-
     # La Venta Real de cada Marca se calcula mes a mes con
     # `venta_real_por_marca`: usa el total oficial de la hoja "Sheet2"
     # cuando está disponible (ya corrige correctamente cualquier semana
     # "bisagra" compartida con el mes vecino), y si no, cae de respaldo en
-    # sumar "Venta_USD" de las semanas cargadas que tocan ese mes (igual que
-    # antes: la semana bisagra se cuenta completa en el mes elegido).
+    # sumar "Venta_USD" únicamente de las semanas cargadas que tocan
+    # EXCLUSIVAMENTE ese mes (la semana bisagra se deja afuera hasta que
+    # Sheet2 confirme el mes).
     marcas_presentes = sorted(df_all["Marca"].unique())
     venta_dict = venta_real_por_marca(df_all, venta_mensual_lookup or {}, all_weeks or weeks_mes, marcas_presentes, meses_sel)
     venta_mes = pd.DataFrame({"Marca": list(venta_dict.keys()), "venta_real": list(venta_dict.values())})
+
+    # "Semanas reportadas" / "% de avance": igual criterio que la Venta Real
+    # de arriba, para que no muestren mensajes contradictorios (p. ej. "100%
+    # de avance" con "Venta Real $0"). Si Sheet2 ya confirma el total de
+    # alguna Marca para este/estos mes(es), el mes se considera resuelto
+    # (cualquier semana bisagra ya quedó repartida correctamente dentro de
+    # ese total) y cuenta el avance normal por semanas cargadas. Si Sheet2
+    # todavía no trae nada de este mes, una semana "bisagra" no cuenta como
+    # reportada hasta que Sheet2 la confirme (mismo resguardo que
+    # `venta_real_marca_mes`).
+    sheet2_confirma_mes = bool(venta_mensual_lookup) and any(
+        (marca, y, m) in venta_mensual_lookup for marca in marcas_presentes for (y, m) in meses_sel
+    )
+    if sheet2_confirma_mes:
+        reported = [w for w in weeks_mes if w in set(df_all["Semana"])]
+    else:
+        semanas_exclusivas = {w for w in weeks_mes if meses_tocados_por_semana(w) <= set(meses_sel)}
+        reported = [w for w in weeks_mes if w in semanas_exclusivas and w in set(df_all["Semana"])]
+    pct_avance = len(reported) / len(weeks_mes) if weeks_mes else 0
 
     periodos_sel = {pd.Timestamp(year=y, month=m, day=1).to_period("M") for (y, m) in meses_sel}
     presu_mes = presu[presu["Mes_Fecha"].dt.to_period("M").isin(periodos_sel)]
@@ -1069,9 +1102,12 @@ brand_agg = brand_agg.merge(compute_inventario_actual(df_for_budget), on="Marca"
 # Mes): solo se aplica cuando el filtro de Semana no excluye manualmente
 # ninguna semana del/los mes(es) elegido(s) -- si Semana acota a un
 # subconjunto más fino que el mes completo, Sheet2 no permite aislar esa
-# porción y se deja la suma cruda de Sheet1. Tampoco se aplica en la vista
-# "KPI por Región" (brand_agg_region se calcula aparte): Sheet2 no trae
-# desglose por Región.
+# porción y se deja la suma cruda de Sheet1. La vista "KPI por Región"
+# (brand_agg_region) aplica la misma corrección más abajo, con la salvedad
+# de que solo usa el total de Sheet2 cuando están seleccionadas TODAS las
+# regiones (Sheet2 no trae desglose por Región); si se filtra a un
+# subconjunto de regiones, igual excluye la semana "bisagra" no confirmada
+# para no sobre-contarla, aunque sin la precisión exacta de Sheet2.
 semana_filtro_es_mes_completo = set(weeks_mes_filtro) <= set(weeks_sel)
 if semana_filtro_es_mes_completo and VENTA_MENSUAL_LOOKUP:
     _venta_dict_global = venta_real_por_marca(df_for_budget, VENTA_MENSUAL_LOOKUP, ALL_WEEKS, brand_agg["Marca"], meses_sel)
@@ -1198,6 +1234,28 @@ else:
         )
         week_agg_region = aggregate_by_week(df_region)
         grupo_agg_region = aggregate_by_grupo(df_region)
+
+        # Misma corrección de "Venta" que la vista KPI principal. El total de
+        # Sheet2 es de TODAS las regiones juntas, así que solo se usa
+        # directamente cuando region_sel cubre todas las regiones (equivale
+        # al universo completo); si es un subconjunto, se excluye igual la
+        # semana "bisagra" no confirmada (sin poder aislar el monto exacto
+        # de Sheet2 para ese subconjunto de regiones).
+        region_es_todas = len(region_sel) == len(ALL_REGIONES)
+        if semana_filtro_es_mes_completo and (not region_es_todas or VENTA_MENSUAL_LOOKUP):
+            _venta_dict_region = venta_real_por_marca(
+                df_region_budget, VENTA_MENSUAL_LOOKUP, ALL_WEEKS, brand_agg_region["Marca"], meses_sel,
+                usar_sheet2=region_es_todas,
+            )
+            brand_agg_region["venta"] = brand_agg_region["Marca"].map(_venta_dict_region).fillna(brand_agg_region["venta"])
+            _total_venta_corr_region = brand_agg_region["venta"].sum()
+            brand_agg_region["participacion"] = np.where(
+                _total_venta_corr_region != 0, brand_agg_region["venta"] / _total_venta_corr_region, 0
+            )
+            brand_agg_region["margen"] = np.where(
+                brand_agg_region["venta"] != 0, brand_agg_region["contribucion"] / brand_agg_region["venta"], 0
+            )
+
         region_label = "Todas las regiones" if len(region_sel) == len(ALL_REGIONES) else " + ".join(region_sel)
         st.caption(
             f"Región(es) seleccionada(s): **{region_label}** — respeta también los filtros de "
