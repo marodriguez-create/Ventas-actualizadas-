@@ -29,6 +29,16 @@ construcción del dashboard:
   marca, no una serie semanal: se compara contra la Contribución real del mes
   en curso con el mismo criterio de Presupuesto vs. Real (cumplimiento,
   ritmo, semáforo) que ya se usa para Venta.
+- "Región" (columna opcional en Sheet1) puede traer varias filas por
+  Marca+Semana (una por Región). Venta, Contribución y Clientes Activados se
+  SUMAN normalmente entre esas filas (el total por marca no cambia); pero
+  "Rotación" y "Presupuesto de contribución" llegan replicados/repartidos
+  entre Regiones de una misma Marca+Semana, así que primero se colapsan a
+  nivel de semana (promedio o suma según corresponda) ANTES de agregarlos
+  por marca o por mes, para no sesgar el resultado según cuántas Regiones
+  se hayan reportado esa semana. Hay una vista aparte "KPI por Región" que
+  permite filtrar los mismos KPI por una o varias Regiones; si el archivo no
+  trae la columna "Región", todo se trata como una sola región ("N/A").
 
 Ejecutar localmente:  streamlit run app.py
 """
@@ -235,6 +245,8 @@ def parse_ventas_sheet(ws):
                 col_map["Venta Neta"] = c
             elif vs in ("inventario",):
                 col_map["Inventario"] = c
+            elif vs in ("región", "region"):
+                col_map["Región"] = c
 
     rows = []
     for r in range(header_row + 1, ws.max_row + 1):
@@ -246,6 +258,7 @@ def parse_ventas_sheet(ws):
             "Marca": str(marca).strip(),
             "Semana": str(semana).strip(),
             "Grupo compra": ws.cell(row=r, column=col_map["Grupo compra"]).value if "Grupo compra" in col_map else "N/A",
+            "Región": str(ws.cell(row=r, column=col_map["Región"]).value).strip() if "Región" in col_map and ws.cell(row=r, column=col_map["Región"]).value is not None else "N/A",
             "Clientes activados": ws.cell(row=r, column=col_map["Clientes activados"]).value if "Clientes activados" in col_map else None,
             "Contribución": ws.cell(row=r, column=col_map["Contribución"]).value if "Contribución" in col_map else None,
             "Rotación": ws.cell(row=r, column=col_map["Rotación"]).value if "Rotación" in col_map else None,
@@ -395,6 +408,13 @@ def derive_raw(raw: pd.DataFrame) -> pd.DataFrame:
         pd.to_numeric(df["Presupuesto Contribucion"], errors="coerce")
         if "Presupuesto Contribucion" in df.columns else np.nan
     )
+    # "Región" es opcional: si el archivo/CSV no la trae, se trata todo como
+    # una sola región ("N/A") para que el resto de la lógica no tenga que
+    # distinguir casos.
+    if "Región" not in df.columns:
+        df["Región"] = "N/A"
+    else:
+        df["Región"] = df["Región"].fillna("N/A").astype(str).str.strip().replace("", "N/A")
     mes_info = df["Semana"].apply(semana_a_mes)
     df["Mes"] = mes_info.apply(lambda t: t[0])
     df["Mes_Year"] = mes_info.apply(lambda t: t[1])
@@ -403,14 +423,31 @@ def derive_raw(raw: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def collapse_region_rotacion(df: pd.DataFrame) -> pd.DataFrame:
+    """Una fila por Marca+Grupo+Semana+Mes (colapsando Región) con el
+    promedio de Rotación de esa semana. Cuando el archivo trae varias filas
+    por Marca+Semana (una por Región), "Rotación" llega replicada con el
+    mismo valor en cada una; promediar aquí ANTES de promediar entre semanas
+    evita que una semana con más Regiones reportadas (o una Marca sin
+    desglose regional) pese distinto que otra en el promedio final. El
+    criterio de negocio sigue siendo el mismo: Rotación nunca se suma,
+    siempre se promedia — ahora en dos pasos (semana, luego marca/grupo/mes)
+    en vez de uno solo."""
+    cols = ["Marca", "Grupo", "Semana", "Mes", "Mes_Year", "Mes_Month"]
+    return df.groupby(cols, as_index=False)["Rotacion"].mean()
+
+
 def aggregate_by_brand(df: pd.DataFrame) -> pd.DataFrame:
     g = df.groupby(["Marca", "Grupo"], as_index=False).agg(
         venta=("Venta_USD", "sum"),
         contribucion=("Contribucion_USD", "sum"),
         clientes=("Clientes", "sum"),
+    )
+    rot = collapse_region_rotacion(df).groupby(["Marca", "Grupo"], as_index=False).agg(
         rotacion=("Rotacion", "mean"),
         rot_count=("Rotacion", "count"),
     )
+    g = g.merge(rot, on=["Marca", "Grupo"], how="left")
     total_venta = g["venta"].sum()
     g["participacion"] = np.where(total_venta != 0, g["venta"] / total_venta, 0)
     g["margen"] = np.where(g["venta"] != 0, g["contribucion"] / g["venta"], 0)
@@ -422,8 +459,9 @@ def aggregate_by_week(df: pd.DataFrame) -> pd.DataFrame:
         venta=("Venta_USD", "sum"),
         contribucion=("Contribucion_USD", "sum"),
         clientes=("Clientes", "sum"),
-        rotacion=("Rotacion", "mean"),
     )
+    rot = collapse_region_rotacion(df).groupby("Semana", as_index=False)["Rotacion"].mean().rename(columns={"Rotacion": "rotacion"})
+    g = g.merge(rot, on="Semana", how="left")
     return g.sort_values("Semana")
 
 
@@ -432,9 +470,10 @@ def aggregate_by_grupo(df: pd.DataFrame) -> pd.DataFrame:
         venta=("Venta_USD", "sum"),
         contribucion=("Contribucion_USD", "sum"),
         clientes=("Clientes", "sum"),
-        rotacion=("Rotacion", "mean"),
         marcas=("Marca", "nunique"),
     )
+    rot = collapse_region_rotacion(df).groupby("Grupo", as_index=False)["Rotacion"].mean().rename(columns={"Rotacion": "rotacion"})
+    g = g.merge(rot, on="Grupo", how="left")
     return g
 
 
@@ -480,11 +519,19 @@ def compute_contribucion_budget_comparison(df_all: pd.DataFrame, grupos_sel, mar
     # semanal: se busca en TODAS las semanas cargadas (no solo el mes en
     # curso), porque el archivo puede etiquetarlo en cualquier semana del
     # rango exportado (p. ej. la primera), incluso si esa semana cae en un
-    # mes distinto al mes en curso según la regla ISO del jueves.
-    presu_rows = df_all[df_all["PresupContrib_Miles"].notna()].sort_values("Semana")
+    # mes distinto al mes en curso según la regla ISO del jueves. Si el
+    # archivo trae varias filas por Marca+Semana (una por Región), el total
+    # de esa semana viene repartido entre ellas, así que primero se SUMAN
+    # las Regiones de cada Marca+Semana antes de tomar el último valor
+    # (chronológicamente) por marca.
+    presu_rows = df_all[df_all["PresupContrib_Miles"].notna()]
     if presu_rows.empty:
         return None
-    presu_contrib = presu_rows.groupby("Marca", as_index=False)["PresupContrib_Miles"].last()
+    presu_semana = (
+        presu_rows.groupby(["Marca", "Semana"], as_index=False)["PresupContrib_Miles"].sum()
+        .sort_values("Semana")
+    )
+    presu_contrib = presu_semana.groupby("Marca", as_index=False)["PresupContrib_Miles"].last()
     presu_contrib["presupuesto_contrib"] = presu_contrib["PresupContrib_Miles"] * 1000
 
     marca_grupo = df_all.drop_duplicates("Marca").set_index("Marca")["Grupo"]
@@ -691,6 +738,71 @@ def vbar_chart(labels, values, color, fmt=fmt_num, title=None):
     return fig
 
 
+def render_kpi_view(brand_agg: pd.DataFrame, week_agg: pd.DataFrame, grupo_agg: pd.DataFrame, top_n: int):
+    """Tarjetas KPI + gráficos Top-N + evolución semanal + venta por grupo.
+    Se reutiliza tanto en la vista '📈 KPI' (todas las Regiones) como en
+    '🗺️ KPI por Región' (Región(es) seleccionada(s)); solo cambian las
+    tablas ya agregadas que se le pasan."""
+    total_venta = brand_agg["venta"].sum()
+    total_contrib = brand_agg["contribucion"].sum()
+    margen = total_contrib / total_venta if total_venta else 0
+    total_clientes = brand_agg["clientes"].sum()
+    marcas_activas = (brand_agg["venta"] > 0).sum()
+    top3 = brand_agg.nlargest(3, "venta")["venta"].sum()
+    conc = top3 / total_venta if total_venta else 0
+
+    tiene_inventario = "inventario" in brand_agg.columns and brand_agg["inventario"].notna().any()
+    total_inventario = brand_agg["inventario"].sum(skipna=True) if tiene_inventario else 0
+
+    k1, k2, k3, k4, k5, k6 = st.columns(6)
+    k1.metric("Venta total (USD)", f"${total_venta:,.0f}")
+    k2.metric("Contribución total (USD)", f"${total_contrib:,.0f}")
+    k3.metric("Margen de contribución", f"{margen:.1%}")
+    k4.metric("Clientes activados", f"{total_clientes:,.0f}")
+    k5.metric("Marcas activas", f"{marcas_activas} / {len(brand_agg)}")
+    k6.metric("Concentración Top 3 marcas", f"{conc:.1%}")
+
+    if tiene_inventario:
+        k7, _, _ = st.columns(3)
+        k7.metric("Inventario actual (USD)", f"${total_inventario:,.0f}")
+        st.caption(
+            "Inventario actual = suma del último nivel reportado por cada marca "
+            "(nunca se suma entre semanas; cada marca aporta su dato más reciente)."
+        )
+
+    if brand_agg.empty:
+        st.info("No hay datos para los filtros seleccionados.")
+        return
+
+    top_venta = brand_agg.nlargest(top_n, "venta")
+    top_contrib = brand_agg.nlargest(top_n, "contribucion")
+    top_clientes = brand_agg.nlargest(top_n, "clientes")
+    top_rot = brand_agg[brand_agg["rot_count"] > 0].nlargest(top_n, "rotacion")
+
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        st.plotly_chart(hbar_chart(top_venta["Marca"], top_venta["venta"], BLUE, title=f"Top {len(top_venta)} marcas por venta (USD)"), width='stretch')
+        st.plotly_chart(hbar_chart(top_clientes["Marca"], top_clientes["clientes"], AQUA, fmt=fmt_num, title=f"Top {len(top_clientes)} marcas por clientes activados"), width='stretch')
+    with cc2:
+        st.plotly_chart(hbar_chart(top_contrib["Marca"], top_contrib["contribucion"], ORANGE, title=f"Top {len(top_contrib)} marcas por contribución (USD)"), width='stretch')
+        st.plotly_chart(hbar_chart(top_rot["Marca"], top_rot["rotacion"], RED, fmt=fmt_num1, title=f"Top {len(top_rot)} marcas por índice de rotación"), width='stretch')
+
+    if tiene_inventario:
+        top_inv = brand_agg[brand_agg["inventario"].notna()].nlargest(top_n, "inventario")
+        st.plotly_chart(
+            hbar_chart(top_inv["Marca"], top_inv["inventario"], MUTED, fmt=fmt_usd, title=f"Top {len(top_inv)} marcas por inventario (USD, nivel más reciente)"),
+            width='stretch',
+        )
+
+    cc3, cc4 = st.columns(2)
+    with cc3:
+        st.plotly_chart(line_chart(week_agg["Semana"], week_agg["venta"], BLUE, title="Evolución semanal de venta (USD)"), width='stretch')
+    with cc4:
+        st.plotly_chart(vbar_chart(week_agg["Semana"], week_agg["clientes"], VIOLET, title="Clientes activados por semana (total)"), width='stretch')
+
+    st.plotly_chart(vbar_chart(grupo_agg["Grupo"], grupo_agg["venta"], BLUE, title="Venta por grupo de compra (USD)"), width='stretch')
+
+
 # ----------------------------------------------------------------------
 # Estado de sesión: datos activos (por defecto o reemplazados por upload)
 # ----------------------------------------------------------------------
@@ -734,6 +846,7 @@ acciones_hits = st.session_state.acciones_hits
 ALL_WEEKS = sorted(raw["Semana"].unique())
 ALL_GRUPOS = sorted(raw["Grupo"].unique())
 ALL_BRANDS = sorted(raw["Marca"].unique())
+ALL_REGIONES = sorted(raw["Región"].unique())
 BRAND_GRUPO = dict(zip(raw["Marca"], raw["Grupo"]))
 
 acciones_full = build_full_acciones(acciones_hits, ALL_BRANDS)
@@ -758,7 +871,7 @@ with header_izq:
 with header_der:
     st.markdown(
         "<div style='text-align:right; padding-top:22px; color:#888; "
-        "font-style:italic; font-size:0.95rem; font-weight:bold;'>MAR</div>",
+        "font-style:italic; font-size:0.95rem; font-weight:bold;'>By MARS</div>",
         unsafe_allow_html=True,
     )
 st.caption(
@@ -816,7 +929,7 @@ brand_agg = brand_agg.merge(compute_inventario_actual(df_for_budget), on="Marca"
 # Selector de vista: Presupuesto / KPI
 # ----------------------------------------------------------------------
 view = st.segmented_control(
-    "Vista", ["💰 Presupuesto", "📈 KPI"], default="💰 Presupuesto", label_visibility="collapsed"
+    "Vista", ["💰 Presupuesto", "📈 KPI", "🗺️ KPI por Región"], default="💰 Presupuesto", label_visibility="collapsed"
 )
 if view is None:
     view = "💰 Presupuesto"
@@ -904,62 +1017,35 @@ if view == "💰 Presupuesto":
             tabla_c.columns = ["Marca", "Grupo", "Presupuesto Contribución (USD)", "Contribución Real (USD)", "% Cumplimiento", "Ritmo vs. calendario", "Estado"]
             st.dataframe(tabla_c, width='stretch', hide_index=True)
 
-else:
+elif view == "📈 KPI":
     st.subheader("Indicadores y KPI")
-    total_venta = brand_agg["venta"].sum()
-    total_contrib = brand_agg["contribucion"].sum()
-    margen = total_contrib / total_venta if total_venta else 0
-    total_clientes = brand_agg["clientes"].sum()
-    marcas_activas = (brand_agg["venta"] > 0).sum()
-    top3 = brand_agg.nlargest(3, "venta")["venta"].sum()
-    conc = top3 / total_venta if total_venta else 0
+    render_kpi_view(brand_agg, week_agg, grupo_agg, top_n)
 
-    tiene_inventario = "inventario" in brand_agg.columns and brand_agg["inventario"].notna().any()
-    total_inventario = brand_agg["inventario"].sum(skipna=True) if tiene_inventario else 0
-
-    k1, k2, k3, k4, k5, k6 = st.columns(6)
-    k1.metric("Venta total (USD)", f"${total_venta:,.0f}")
-    k2.metric("Contribución total (USD)", f"${total_contrib:,.0f}")
-    k3.metric("Margen de contribución", f"{margen:.1%}")
-    k4.metric("Clientes activados", f"{total_clientes:,.0f}")
-    k5.metric("Marcas activas", f"{marcas_activas} / {len(brand_agg)}")
-    k6.metric("Concentración Top 3 marcas", f"{conc:.1%}")
-
-    if tiene_inventario:
-        k7, _, _ = st.columns(3)
-        k7.metric("Inventario actual (USD)", f"${total_inventario:,.0f}")
+else:
+    st.subheader("Indicadores y KPI por Región")
+    region_col, _ = st.columns([1.3, 3.7])
+    with region_col:
+        region_sel = st.multiselect(
+            "Región", ALL_REGIONES, default=ALL_REGIONES,
+            help="Puedes ver una Región sola o combinar varias; los KPI se suman entre las Regiones seleccionadas.",
+        )
+    if not region_sel:
+        st.warning("Selecciona al menos una Región.")
+    else:
+        df_region = df_filtered[df_filtered["Región"].isin(region_sel)]
+        df_region_budget = df_for_budget[df_for_budget["Región"].isin(region_sel)]
+        brand_agg_region = aggregate_by_brand(df_region)
+        brand_agg_region = brand_agg_region.merge(
+            compute_inventario_actual(df_region_budget), on="Marca", how="left"
+        )
+        week_agg_region = aggregate_by_week(df_region)
+        grupo_agg_region = aggregate_by_grupo(df_region)
+        region_label = "Todas las regiones" if len(region_sel) == len(ALL_REGIONES) else " + ".join(region_sel)
         st.caption(
-            "Inventario actual = suma del último nivel reportado por cada marca "
-            "(nunca se suma entre semanas; cada marca aporta su dato más reciente)."
+            f"Región(es) seleccionada(s): **{region_label}** — respeta también los filtros de "
+            "Mes, Semana, Grupo de Compra y Marca de arriba."
         )
-
-    top_venta = brand_agg.nlargest(top_n, "venta")
-    top_contrib = brand_agg.nlargest(top_n, "contribucion")
-    top_clientes = brand_agg.nlargest(top_n, "clientes")
-    top_rot = brand_agg[brand_agg["rot_count"] > 0].nlargest(top_n, "rotacion")
-
-    cc1, cc2 = st.columns(2)
-    with cc1:
-        st.plotly_chart(hbar_chart(top_venta["Marca"], top_venta["venta"], BLUE, title=f"Top {len(top_venta)} marcas por venta (USD)"), width='stretch')
-        st.plotly_chart(hbar_chart(top_clientes["Marca"], top_clientes["clientes"], AQUA, fmt=fmt_num, title=f"Top {len(top_clientes)} marcas por clientes activados"), width='stretch')
-    with cc2:
-        st.plotly_chart(hbar_chart(top_contrib["Marca"], top_contrib["contribucion"], ORANGE, title=f"Top {len(top_contrib)} marcas por contribución (USD)"), width='stretch')
-        st.plotly_chart(hbar_chart(top_rot["Marca"], top_rot["rotacion"], RED, fmt=fmt_num1, title=f"Top {len(top_rot)} marcas por índice de rotación"), width='stretch')
-
-    if tiene_inventario:
-        top_inv = brand_agg[brand_agg["inventario"].notna()].nlargest(top_n, "inventario")
-        st.plotly_chart(
-            hbar_chart(top_inv["Marca"], top_inv["inventario"], MUTED, fmt=fmt_usd, title=f"Top {len(top_inv)} marcas por inventario (USD, nivel más reciente)"),
-            width='stretch',
-        )
-
-    cc3, cc4 = st.columns(2)
-    with cc3:
-        st.plotly_chart(line_chart(week_agg["Semana"], week_agg["venta"], BLUE, title="Evolución semanal de venta (USD)"), width='stretch')
-    with cc4:
-        st.plotly_chart(vbar_chart(week_agg["Semana"], week_agg["clientes"], VIOLET, title="Clientes activados por semana (total)"), width='stretch')
-
-    st.plotly_chart(vbar_chart(grupo_agg["Grupo"], grupo_agg["venta"], BLUE, title="Venta por grupo de compra (USD)"), width='stretch')
+        render_kpi_view(brand_agg_region, week_agg_region, grupo_agg_region, top_n)
 
 # ----------------------------------------------------------------------
 # Tabla de datos por marca + matriz de rotación por mes (siempre visibles)
@@ -985,7 +1071,8 @@ with st.expander("Ver rotación promedio por mes y marca (matriz)"):
         'Promedio simple de "Rotación" por marca dentro de cada mes '
         "(nunca se suma)."
     )
-    pivot = df_filtered.pivot_table(index="Marca", columns="Mes", values="Rotacion", aggfunc="mean")
+    rot_semanal = collapse_region_rotacion(df_filtered)
+    pivot = rot_semanal.pivot_table(index="Marca", columns="Mes", values="Rotacion", aggfunc="mean")
     # incluye todos los meses presentes en los datos filtrados aunque ningún
     # valor de Rotación caiga en ese mes (se muestra la columna en blanco,
     # igual que el "-" del Excel), en vez de omitirla silenciosamente.
