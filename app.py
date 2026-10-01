@@ -1,4 +1,4 @@
-"""
+ """
 Ventas de marcas Febeca — Dashboard Streamlit
 ==============================================
 
@@ -632,10 +632,12 @@ def kpi_por_region_tabla(
 ) -> pd.DataFrame:
     """Una fila por Región (de las seleccionadas) con los mismos indicadores
     que las tarjetas de KPI: Venta, Contribución, Margen de contribución,
-    Clientes activados, Marcas activas y Concentración Top 3; más Inventario
-    actual si la hoja lo trae. Cada Región se agrega de forma independiente
-    (Rotación e Inventario nunca se suman entre semanas; Venta, Contribución
-    y Clientes sí).
+    Clientes activados, Marcas activas y Concentración Top 3. NO incluye
+    Inventario: en el archivo, Inventario llega como un dato único por
+    Marca+Semana que se repite igual en las filas de las 4 Regiones (no es
+    un valor reportado por Región), así que desglosarlo por Región mostraría
+    el mismo número repetido en cada fila, dando la impresión equivocada de
+    que cada Región tiene su propio inventario independiente.
 
     La Venta de cada Región usa el mismo resguardo de la semana "bisagra"
     que el total general: si el filtro de Semana cubre el mes completo y
@@ -668,13 +670,10 @@ def kpi_por_region_tabla(
         marcas_total = len(brand_agg_r)
         top3 = brand_agg_r.nlargest(3, "venta")["venta"].sum() if not brand_agg_r.empty else 0
         concentracion = top3 / venta if venta else 0
-        df_rb_inv = df_region_budget[df_region_budget["Región"] == region]
-        inv_df = compute_inventario_actual(df_rb_inv)
-        inventario = inv_df["inventario"].sum(skipna=True) if not inv_df.empty else np.nan
         filas.append({
             "Región": region, "venta": venta, "contribucion": contrib, "margen": margen,
             "clientes": clientes, "marcas_activas": marcas_activas, "marcas_total": marcas_total,
-            "concentracion": concentracion, "inventario": inventario,
+            "concentracion": concentracion,
         })
     return pd.DataFrame(filas).sort_values("venta", ascending=False).reset_index(drop=True)
 
@@ -955,12 +954,12 @@ def multi_line_chart(df: pd.DataFrame, x_col: str, y_col: str, series_col: str, 
     fig.update_layout(
         title=title,
         template="plotly_white",
-        margin=dict(l=10, r=10, t=40 if title else 10, b=10),
+        margin=dict(l=10, r=10, t=40 if title else 10, b=50),
         xaxis=dict(showgrid=False),
         yaxis=dict(showgrid=True, gridcolor=GRID, zeroline=False, tickformat="~s"),
-        height=380,
+        height=400,
         showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        legend=dict(orientation="h", yanchor="top", y=-0.18, xanchor="center", x=0.5),
     )
     return fig
 
@@ -1022,7 +1021,6 @@ def render_kpi_view(brand_agg: pd.DataFrame, week_agg: pd.DataFrame, grupo_agg: 
     if region_breakdown is not None and not region_breakdown.empty:
         st.markdown("**Indicadores por Región**")
         tabla_r = region_breakdown.copy()
-        tiene_inv_region = tabla_r["inventario"].notna().any()
         tabla_r["marcas_activas_total"] = tabla_r.apply(
             lambda r: f"{int(r['marcas_activas'])} / {int(r['marcas_total'])}", axis=1
         )
@@ -1033,10 +1031,6 @@ def render_kpi_view(brand_agg: pd.DataFrame, week_agg: pd.DataFrame, grupo_agg: 
         tabla_r["concentracion"] = tabla_r["concentracion"].map(lambda v: f"{v:.1%}")
         cols = ["Región", "venta", "contribucion", "margen", "clientes", "marcas_activas_total", "concentracion"]
         nombres = ["Región", "Venta (USD)", "Contribución (USD)", "Margen de contribución", "Clientes activados", "Marcas activas", "Concentración Top 3"]
-        if tiene_inv_region:
-            tabla_r["inventario"] = tabla_r["inventario"].map(lambda v: f"${v:,.0f}" if pd.notna(v) else "-")
-            cols.append("inventario")
-            nombres.append("Inventario actual (USD)")
         tabla_r = tabla_r[cols]
         tabla_r.columns = nombres
         st.dataframe(tabla_r, width='stretch', hide_index=True)
@@ -1044,7 +1038,9 @@ def render_kpi_view(brand_agg: pd.DataFrame, week_agg: pd.DataFrame, grupo_agg: 
             "La Venta de cada Región usa el mismo resguardo de la semana \"bisagra\" que el "
             "total de arriba, pero nunca se sustituye por el total de Sheet2 (ese total es de "
             "todas las Regiones juntas, no de una sola), así que ninguna fila por sí sola refleja "
-            "el total exacto del mes — para eso está el total combinado de arriba."
+            "el total exacto del mes — para eso está el total combinado de arriba. No se incluye "
+            "Inventario porque en el archivo llega como un dato único por Marca+Semana (no por "
+            "Región), igual que Rotación."
         )
 
     if brand_agg.empty:
