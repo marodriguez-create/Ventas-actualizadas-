@@ -39,11 +39,25 @@ construcción del dashboard:
   se hayan reportado esa semana. Hay una vista aparte "KPI por Región" que
   permite filtrar los mismos KPI por una o varias Regiones; si el archivo no
   trae la columna "Región", todo se trata como una sola región ("N/A").
+- "Sheet2" (hoja opcional): venta COMPLETA por Marca y Mes calendario, tal
+  como la calcula el sistema de origen (columnas Marca + una columna de mes
+  tipo "8-2026" + "Venta Neta"). Se usa para corregir el monto de "Venta" de
+  cualquier semana "bisagra" compartida entre dos meses: en vez de contar esa
+  semana completa en el mes que se elija (regla anterior), se usa
+  directamente el total de Sheet2 de ese Marca+Mes — así, la misma semana
+  bisagra aporta un monto distinto al filtrar Agosto que al filtrar
+  Septiembre, cada uno con su propio total oficial. Si Sheet2 no trae un
+  Marca+Mes (archivo sin esa hoja, o mes sin dato todavía), se usa de
+  respaldo la regla anterior. Esta corrección solo aplica a "Venta" (no a
+  Contribución, Clientes ni Rotación) y solo cuando el filtro de Semana no
+  recorta manualmente el mes completo; no aplica en la vista "KPI por
+  Región" (Sheet2 no trae desglose regional).
 
 Ejecutar localmente:  streamlit run app.py
 """
 
 import io
+import re
 import datetime
 from pathlib import Path
 
@@ -164,6 +178,47 @@ def mes_en_curso_default(all_weeks):
     return year, month
 
 
+def venta_real_marca_mes(df_all: pd.DataFrame, venta_mensual_lookup: dict, all_weeks, marca: str, year: int, month: int):
+    """Venta real de una Marca para un mes calendario completo (year, month).
+
+    Si la hoja "Sheet2" (venta completa por Marca y Mes, tal como la calcula
+    el sistema de origen) trae el dato de esa Marca+Mes, se usa DIRECTAMENTE
+    — ya es el total correcto del mes completo, incluyendo automáticamente
+    la porción que le corresponde de cualquier semana "bisagra" compartida
+    con el mes vecino (equivale a restarle a ese total las semanas que no
+    chocan, como pidió María Antonieta, pero sin tener que aislar cada
+    semana bisagra una por una: la resta y el total dan el mismo resultado).
+    Por eso una misma semana bisagra puede aportar un monto distinto según
+    se esté mirando Agosto o Septiembre — cada mes usa su propio total de
+    Sheet2.
+
+    Si Sheet2 no trae esa Marca+Mes (p. ej. todavía no se subió, o es un mes
+    futuro), se usa como respaldo la regla anterior: sumar "Venta_USD" de
+    todas las semanas cargadas que tocan ese mes (la semana bisagra se
+    cuenta completa, una sola vez)."""
+    key = (marca, year, month)
+    if venta_mensual_lookup and key in venta_mensual_lookup:
+        return venta_mensual_lookup[key]
+    weeks_mes = weeks_for_meses(all_weeks, [(year, month)])
+    sub = df_all[(df_all["Marca"] == marca) & (df_all["Semana"].isin(weeks_mes))]
+    return sub["Venta_USD"].sum()
+
+
+def venta_real_por_marca(df_all: pd.DataFrame, venta_mensual_lookup: dict, all_weeks, marcas, meses_sel) -> dict:
+    """{Marca: venta_real} sumando `venta_real_marca_mes` sobre todos los
+    meses seleccionados (si se eligieron varios meses, se suman sus
+    totales — cada mes de Sheet2 ya es una porción exclusiva, así que no hay
+    riesgo de contar dos veces una semana bisagra compartida entre dos meses
+    que estén AMBOS seleccionados)."""
+    return {
+        marca: sum(
+            venta_real_marca_mes(df_all, venta_mensual_lookup, all_weeks, marca, y, m)
+            for (y, m) in meses_sel
+        )
+        for marca in marcas
+    }
+
+
 def estado_ritmo(ritmo):
     if ritmo is None or pd.isna(ritmo):
         return "Sin presupuesto asignado"
@@ -183,7 +238,9 @@ def load_default_data():
     raw = pd.read_csv(DATA_DIR / "raw_clean.csv")
     presu = pd.read_csv(DATA_DIR / "presupuesto_raw.csv", parse_dates=["Mes_Fecha"])
     acciones = pd.read_csv(DATA_DIR / "acciones_raw.csv")
-    return raw, presu, acciones
+    venta_mensual_path = DATA_DIR / "venta_mensual_raw.csv"
+    venta_mensual = pd.read_csv(venta_mensual_path) if venta_mensual_path.exists() else None
+    return raw, presu, acciones, venta_mensual
 
 
 def _singularize(s):
@@ -349,9 +406,64 @@ def parse_acciones_sheet(ws):
     return pd.DataFrame(rows) if rows else pd.DataFrame(columns=["Marca", "Accion"])
 
 
+def parse_venta_mensual_sheet(ws):
+    """Hoja opcional "Sheet2": venta COMPLETA por Marca y Mes calendario (no
+    por semana ISO), tal como la calcula el sistema de origen. Se usa para
+    corregir el monto de "Venta" de cualquier semana "bisagra" compartida
+    entre dos meses — ver `venta_real_marca_mes`. La columna de mes suele
+    traer un encabezado técnico (p. ej. "'Dim_Calendario'[Nro Mes]"), así que
+    en vez de buscarla por nombre se detecta la columna cuyos valores tienen
+    forma "M-AAAA" o "MM-AAAA" (p. ej. "8-2026" = Agosto 2026)."""
+    header_row, cols = _find_header_row(ws, ["marca"])
+    if header_row is None:
+        return None
+    marca_col = cols["marca"]
+
+    venta_col = None
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(row=header_row, column=c).value
+        if v is None:
+            continue
+        vs = str(v).strip().lower()
+        if vs in ("venta neta", "venta real", "venta", "venta completa"):
+            venta_col = c
+    if venta_col is None:
+        return None
+
+    mes_pat = re.compile(r"^\s*(\d{1,2})\s*-\s*(\d{4})\s*$")
+    mes_col = None
+    for c in range(1, ws.max_column + 1):
+        if c in (marca_col, venta_col):
+            continue
+        sample = ws.cell(row=header_row + 1, column=c).value
+        if sample is not None and mes_pat.match(str(sample)):
+            mes_col = c
+            break
+    if mes_col is None:
+        return None
+
+    rows = []
+    for r in range(header_row + 1, ws.max_row + 1):
+        marca = ws.cell(row=r, column=marca_col).value
+        mes_val = ws.cell(row=r, column=mes_col).value
+        if marca is None or mes_val is None:
+            continue
+        m = mes_pat.match(str(mes_val))
+        if not m:
+            continue
+        rows.append({
+            "Marca": str(marca).strip(),
+            "Mes_Month": int(m.group(1)),
+            "Mes_Year": int(m.group(2)),
+            "VentaCompleta_Miles": ws.cell(row=r, column=venta_col).value,
+        })
+    return pd.DataFrame(rows) if rows else None
+
+
 def parse_uploaded_workbook(file_bytes):
-    """Lee 'Ventas actualizadas.xlsx' (Sheet1 + Presupuesto + Acciones opcionales).
-    Devuelve (raw_df, presupuesto_df_or_None, acciones_df_or_None, avisos)."""
+    """Lee 'Ventas actualizadas.xlsx' (Sheet1 + Presupuesto + Acciones +
+    Sheet2 opcionales). Devuelve (raw_df, presupuesto_df_or_None,
+    acciones_df_or_None, venta_mensual_df_or_None, avisos)."""
     wb = load_workbook(io.BytesIO(file_bytes), data_only=True)
     avisos = []
 
@@ -376,7 +488,19 @@ def parse_uploaded_workbook(file_bytes):
     else:
         avisos.append('El archivo no trae una hoja "Acciones"; se conservan las acciones anteriores.')
 
-    return raw, presu, acciones, avisos
+    venta_mensual = None
+    venta_mensual_name = next((n for n in wb.sheetnames if n.strip().lower() == "sheet2"), None)
+    if venta_mensual_name:
+        venta_mensual = parse_venta_mensual_sheet(wb[venta_mensual_name])
+        if venta_mensual is None:
+            avisos.append(
+                'No se pudo leer la hoja "Sheet2" (se esperan columnas "Marca", una columna de mes '
+                'tipo "8-2026" y "Venta Neta"); se conserva la venta mensual anterior, si había.'
+            )
+    # Sheet2 es opcional: si no viene, simplemente se usa la regla anterior
+    # para la(s) semana(s) "bisagra" (no hace falta avisar cada vez).
+
+    return raw, presu, acciones, venta_mensual, avisos
 
 
 def build_full_acciones(acciones_hits: pd.DataFrame, all_brands):
@@ -569,7 +693,7 @@ def compute_contribucion_budget_comparison(df_all: pd.DataFrame, grupos_sel, mar
     }
 
 
-def compute_budget_comparison(df_all: pd.DataFrame, presu: pd.DataFrame, grupos_sel, marcas_sel, meses_sel, weeks_mes, mes_label):
+def compute_budget_comparison(df_all: pd.DataFrame, presu: pd.DataFrame, grupos_sel, marcas_sel, meses_sel, weeks_mes, mes_label, venta_mensual_lookup=None, all_weeks=None):
     """Presupuesto vs. Real del/los mes(es) seleccionado(s) en el filtro de
     Mes (ignora el filtro de Semana, pero sí respeta Grupo y Marca), igual
     que en el HTML/Excel originales. Si se seleccionan varios meses, el
@@ -580,15 +704,15 @@ def compute_budget_comparison(df_all: pd.DataFrame, presu: pd.DataFrame, grupos_
     reported = [w for w in weeks_mes if w in set(df_all["Semana"])]
     pct_avance = len(reported) / len(weeks_mes) if weeks_mes else 0
 
-    # Igual que en Presupuesto de Contribución: se filtra por la lista de
-    # semanas del mes elegido (weeks_mes), no por la etiqueta "Mes" de cada
-    # fila, para incluir una semana "bisagra" que toque el mes seleccionado
-    # aunque su jueves caiga en el mes vecino.
-    venta_mes = (
-        df_all[df_all["Semana"].isin(weeks_mes)]
-        .groupby("Marca", as_index=False)["Venta_USD"].sum()
-        .rename(columns={"Venta_USD": "venta_real"})
-    )
+    # La Venta Real de cada Marca se calcula mes a mes con
+    # `venta_real_por_marca`: usa el total oficial de la hoja "Sheet2"
+    # cuando está disponible (ya corrige correctamente cualquier semana
+    # "bisagra" compartida con el mes vecino), y si no, cae de respaldo en
+    # sumar "Venta_USD" de las semanas cargadas que tocan ese mes (igual que
+    # antes: la semana bisagra se cuenta completa en el mes elegido).
+    marcas_presentes = sorted(df_all["Marca"].unique())
+    venta_dict = venta_real_por_marca(df_all, venta_mensual_lookup or {}, all_weeks or weeks_mes, marcas_presentes, meses_sel)
+    venta_mes = pd.DataFrame({"Marca": list(venta_dict.keys()), "venta_real": list(venta_dict.values())})
 
     periodos_sel = {pd.Timestamp(year=y, month=m, day=1).to_period("M") for (y, m) in meses_sel}
     presu_mes = presu[presu["Mes_Fecha"].dt.to_period("M").isin(periodos_sel)]
@@ -807,10 +931,11 @@ def render_kpi_view(brand_agg: pd.DataFrame, week_agg: pd.DataFrame, grupo_agg: 
 # Estado de sesión: datos activos (por defecto o reemplazados por upload)
 # ----------------------------------------------------------------------
 if "raw" not in st.session_state:
-    raw0, presu0, acciones0 = load_default_data()
+    raw0, presu0, acciones0, venta_mensual0 = load_default_data()
     st.session_state.raw = raw0
     st.session_state.presu = presu0
     st.session_state.acciones_hits = acciones0
+    st.session_state.venta_mensual = venta_mensual0
     st.session_state.data_label = "Ventas actualizadas.xlsx (datos incluidos por defecto)"
 
 with st.sidebar:
@@ -819,12 +944,14 @@ with st.sidebar:
     uploaded = st.file_uploader("Archivo .xlsx", type=["xlsx"], label_visibility="collapsed")
     if uploaded is not None:
         try:
-            raw_new, presu_new, acciones_new, avisos = parse_uploaded_workbook(uploaded.read())
+            raw_new, presu_new, acciones_new, venta_mensual_new, avisos = parse_uploaded_workbook(uploaded.read())
             st.session_state.raw = raw_new
             if presu_new is not None:
                 st.session_state.presu = presu_new
             if acciones_new is not None:
                 st.session_state.acciones_hits = acciones_new
+            if venta_mensual_new is not None:
+                st.session_state.venta_mensual = venta_mensual_new
             st.session_state.data_label = uploaded.name
             st.success(f"✓ Datos actualizados desde “{uploaded.name}” — {len(raw_new)} filas.")
             for a in avisos:
@@ -834,14 +961,27 @@ with st.sidebar:
 
     st.divider()
     st.caption(
-        "El presupuesto y las acciones se refrescan solo si el archivo "
-        "subido trae esas hojas; de lo contrario se conservan los últimos "
-        "valores cargados."
+        "El presupuesto, las acciones y la venta mensual (hoja Sheet2) se "
+        "refrescan solo si el archivo subido trae esas hojas; de lo "
+        "contrario se conservan los últimos valores cargados."
     )
 
 raw = derive_raw(st.session_state.raw)
 presu = st.session_state.presu
 acciones_hits = st.session_state.acciones_hits
+venta_mensual = st.session_state.get("venta_mensual")
+
+# Diccionario {(Marca, year, month): venta_completa_USD} a partir de Sheet2,
+# si se cargó. Se asume la misma máscara que "Venta Neta" en Sheet1 (miles de
+# USD) -> se multiplica x1000. Si no hay Sheet2 todavía, queda vacío y toda
+# "Venta" usa la regla de respaldo (semana bisagra completa en el mes
+# elegido), igual que antes de este cambio.
+VENTA_MENSUAL_LOOKUP = {}
+if venta_mensual is not None and not venta_mensual.empty:
+    for _, _row in venta_mensual.iterrows():
+        VENTA_MENSUAL_LOOKUP[(_row["Marca"], int(_row["Mes_Year"]), int(_row["Mes_Month"]))] = (
+            pd.to_numeric(_row["VentaCompleta_Miles"], errors="coerce") * 1000
+        )
 
 ALL_WEEKS = sorted(raw["Semana"].unique())
 ALL_GRUPOS = sorted(raw["Grupo"].unique())
@@ -925,6 +1065,21 @@ grupo_agg = aggregate_by_grupo(df_filtered)
 # Presupuesto vs. Real), y se agrega a la tabla por marca.
 brand_agg = brand_agg.merge(compute_inventario_actual(df_for_budget), on="Marca", how="left")
 
+# Corrección de "Venta" con la hoja "Sheet2" (venta completa por Marca y
+# Mes): solo se aplica cuando el filtro de Semana no excluye manualmente
+# ninguna semana del/los mes(es) elegido(s) -- si Semana acota a un
+# subconjunto más fino que el mes completo, Sheet2 no permite aislar esa
+# porción y se deja la suma cruda de Sheet1. Tampoco se aplica en la vista
+# "KPI por Región" (brand_agg_region se calcula aparte): Sheet2 no trae
+# desglose por Región.
+semana_filtro_es_mes_completo = set(weeks_mes_filtro) <= set(weeks_sel)
+if semana_filtro_es_mes_completo and VENTA_MENSUAL_LOOKUP:
+    _venta_dict_global = venta_real_por_marca(df_for_budget, VENTA_MENSUAL_LOOKUP, ALL_WEEKS, brand_agg["Marca"], meses_sel)
+    brand_agg["venta"] = brand_agg["Marca"].map(_venta_dict_global).fillna(brand_agg["venta"])
+    _total_venta_corr = brand_agg["venta"].sum()
+    brand_agg["participacion"] = np.where(_total_venta_corr != 0, brand_agg["venta"] / _total_venta_corr, 0)
+    brand_agg["margen"] = np.where(brand_agg["venta"] != 0, brand_agg["contribucion"] / brand_agg["venta"], 0)
+
 # ----------------------------------------------------------------------
 # Selector de vista: Presupuesto / KPI
 # ----------------------------------------------------------------------
@@ -936,7 +1091,10 @@ if view is None:
 
 if view == "💰 Presupuesto":
     st.subheader("Presupuesto de Venta vs. Real")
-    budget = compute_budget_comparison(df_for_budget, presu, grupos_sel, brands_sel, meses_sel, weeks_mes_filtro, mes_label_sel)
+    budget = compute_budget_comparison(
+        df_for_budget, presu, grupos_sel, brands_sel, meses_sel, weeks_mes_filtro, mes_label_sel,
+        venta_mensual_lookup=VENTA_MENSUAL_LOOKUP, all_weeks=ALL_WEEKS,
+    )
     if budget is None:
         st.info(
             "No hay marcas con presupuesto asignado para los filtros de Mes/Grupo/Marca "
@@ -1123,10 +1281,14 @@ with st.expander("Notas", expanded=False):
         "mes (o meses) completos elegidos en el filtro de Mes y solo incluye marcas "
         'con presupuesto asignado; "Ritmo" compara el % de presupuesto alcanzado '
         "contra el % de semanas ya transcurridas del mes. Una semana que cae en dos "
-        "meses (bisagra) se cuenta en el mes que selecciones, nunca en los dos a la "
-        "vez. Las marcas sin ninguna acción registrada se muestran con la celda de "
-        'Acción vacía. "Inventario" también viene en miles de USD (convertido a USD) '
-        "y es el último nivel reportado por marca (nunca se suma entre semanas). "
+        "meses (bisagra): si el archivo trae la hoja \"Sheet2\" (venta completa por "
+        "Marca y Mes), el monto de \"Venta\" de esa semana se toma del total oficial "
+        "de Sheet2 para el mes que selecciones — por eso puede ser distinto al filtrar "
+        "Agosto que al filtrar Septiembre; si no hay Sheet2 para ese mes, se cuenta la "
+        "semana completa en el mes que selecciones (nunca en los dos a la vez). Las "
+        "marcas sin ninguna acción registrada se muestran con la celda de Acción "
+        'vacía. "Inventario" también viene en miles de USD (convertido a USD) y es el '
+        "último nivel reportado por marca (nunca se suma entre semanas). "
         '"Presupuesto de Contribución" es un total por marca '
         "(no semanal) y se compara contra la Contribución real del mes elegido con "
         "el mismo criterio que el Presupuesto de Venta."
