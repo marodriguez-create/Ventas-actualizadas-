@@ -605,6 +605,15 @@ def aggregate_by_week(df: pd.DataFrame) -> pd.DataFrame:
     return g.sort_values("Semana")
 
 
+def aggregate_by_week_region(df: pd.DataFrame) -> pd.DataFrame:
+    """Venta semanal desglosada por Región, para comparar su evolución
+    semana a semana (solo en la vista 'KPI por Región'). Suma cruda de
+    Venta_USD por Semana y Región, igual criterio que `aggregate_by_week`:
+    no aplica el resguardo de Sheet2 (ese resguardo es para totales
+    mensuales, no para la serie semanal cruda)."""
+    return df.groupby(["Semana", "Región"], as_index=False).agg(venta=("Venta_USD", "sum")).sort_values("Semana")
+
+
 def aggregate_by_grupo(df: pd.DataFrame) -> pd.DataFrame:
     g = df.groupby("Grupo", as_index=False).agg(
         venta=("Venta_USD", "sum"),
@@ -927,6 +936,35 @@ def line_chart(labels, values, color, fmt=fmt_usd, title=None):
     return fig
 
 
+def multi_line_chart(df: pd.DataFrame, x_col: str, y_col: str, series_col: str, fmt=fmt_usd, title=None):
+    """Gráfico de líneas con una serie (línea) por cada valor distinto de
+    `series_col` (p. ej. una línea por Región), todas compartiendo el mismo
+    eje de Semana — para comparar su evolución semana a semana. Reutiliza la
+    misma paleta de colores que el resto del dashboard, repitiéndola si hay
+    más series que colores."""
+    palette = [BLUE, ORANGE, AQUA, VIOLET, RED, MUTED]
+    fig = go.Figure()
+    for i, (serie, sub) in enumerate(df.groupby(series_col)):
+        sub = sub.sort_values(x_col)
+        color = palette[i % len(palette)]
+        fig.add_trace(go.Scatter(
+            x=sub[x_col], y=sub[y_col], mode="lines+markers",
+            name=str(serie), line=dict(color=color, width=2.5), marker=dict(color=color, size=6),
+            hovertemplate="%{x}<br>%{y:,.0f}<extra>" + str(serie) + "</extra>",
+        ))
+    fig.update_layout(
+        title=title,
+        template="plotly_white",
+        margin=dict(l=10, r=10, t=40 if title else 10, b=10),
+        xaxis=dict(showgrid=False),
+        yaxis=dict(showgrid=True, gridcolor=GRID, zeroline=False, tickformat="~s"),
+        height=380,
+        showlegend=True,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    return fig
+
+
 def vbar_chart(labels, values, color, fmt=fmt_num, title=None):
     values = list(values)
     fig = go.Figure(
@@ -948,13 +986,16 @@ def vbar_chart(labels, values, color, fmt=fmt_num, title=None):
     return fig
 
 
-def render_kpi_view(brand_agg: pd.DataFrame, week_agg: pd.DataFrame, grupo_agg: pd.DataFrame, top_n: int, region_breakdown: pd.DataFrame = None):
+def render_kpi_view(brand_agg: pd.DataFrame, week_agg: pd.DataFrame, grupo_agg: pd.DataFrame, top_n: int, region_breakdown: pd.DataFrame = None, week_region_agg: pd.DataFrame = None):
     """Tarjetas KPI + gráficos Top-N + evolución semanal + venta por grupo.
     Se reutiliza tanto en la vista '📈 KPI' (todas las Regiones) como en
     '🗺️ KPI por Región' (Región(es) seleccionada(s)); solo cambian las
     tablas ya agregadas que se le pasan. `region_breakdown` (opcional, solo
     en la vista por Región) agrega una tabla con Venta/Contribución/etc. por
-    cada Región seleccionada, debajo de las tarjetas de totales."""
+    cada Región seleccionada, debajo de las tarjetas de totales.
+    `week_region_agg` (opcional, solo en la vista por Región) agrega un
+    gráfico de evolución semanal con una línea por Región, para comparar su
+    avance semana a semana (no solo el total agregado del mes)."""
     total_venta = brand_agg["venta"].sum()
     total_contrib = brand_agg["contribucion"].sum()
     margen = total_contrib / total_venta if total_venta else 0
@@ -1035,6 +1076,12 @@ def render_kpi_view(brand_agg: pd.DataFrame, week_agg: pd.DataFrame, grupo_agg: 
         st.plotly_chart(line_chart(week_agg["Semana"], week_agg["venta"], BLUE, title="Evolución semanal de venta (USD)"), width='stretch')
     with cc4:
         st.plotly_chart(vbar_chart(week_agg["Semana"], week_agg["clientes"], VIOLET, title="Clientes activados por semana (total)"), width='stretch')
+
+    if week_region_agg is not None and not week_region_agg.empty:
+        st.plotly_chart(
+            multi_line_chart(week_region_agg, "Semana", "venta", "Región", title="Evolución semanal de venta por Región (USD)"),
+            width='stretch',
+        )
 
     st.plotly_chart(vbar_chart(grupo_agg["Grupo"], grupo_agg["venta"], BLUE, title="Venta por grupo de compra (USD)"), width='stretch')
 
@@ -1345,7 +1392,11 @@ else:
             all_weeks=ALL_WEEKS, meses_sel=meses_sel, venta_mensual_lookup=VENTA_MENSUAL_LOOKUP,
             semana_filtro_es_mes_completo=semana_filtro_es_mes_completo,
         )
-        render_kpi_view(brand_agg_region, week_agg_region, grupo_agg_region, top_n, region_breakdown=region_breakdown)
+        week_region_agg = aggregate_by_week_region(df_region)
+        render_kpi_view(
+            brand_agg_region, week_agg_region, grupo_agg_region, top_n,
+            region_breakdown=region_breakdown, week_region_agg=week_region_agg,
+        )
 
 # ----------------------------------------------------------------------
 # Tabla de datos por marca + matriz de rotación por mes (siempre visibles)
