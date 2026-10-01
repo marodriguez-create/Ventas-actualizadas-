@@ -1,4 +1,4 @@
-"""
+  """
 Ventas de marcas Febeca — Dashboard Streamlit
 ==============================================
 
@@ -1185,8 +1185,11 @@ header_izq, header_der = st.columns([5, 1])
 with header_izq:
     st.title("Ventas de marcas Febeca")
 with header_der:
+    logo_path = Path(__file__).parent / "assets" / "febeca_logo.png"
+    if logo_path.exists():
+        st.image(str(logo_path), width='stretch')
     st.markdown(
-        "<div style='text-align:right; padding-top:22px; color:#888; "
+        "<div style='text-align:right; color:#888; "
         "font-style:italic; font-size:0.95rem; font-weight:bold;'>By MARS</div>",
         unsafe_allow_html=True,
     )
