@@ -81,7 +81,11 @@ def semana_a_mes(semana: str):
 
 
 def weeks_in_month(year: int, month: int):
-    """Todas las semanas ISO cuyo jueves cae dentro de (year, month)."""
+    """Todas las semanas ISO cuyo jueves cae dentro de (year, month). Se usa
+    solo para construir la lista de meses disponibles; para decidir qué
+    semanas pertenecen a un mes seleccionado en el filtro se usa
+    weeks_for_meses, que considera semanas "bisagra" en los dos meses que
+    tocan."""
     out = []
     for w in range(1, 54):
         try:
@@ -93,48 +97,61 @@ def weeks_in_month(year: int, month: int):
     return out
 
 
-def mes_en_curso(df_all: pd.DataFrame):
-    """Determina el mes en curso y sus semanas para los comparativos de
-    Presupuesto. Devuelve (mes_label, year, month, weeks_mes).
+def mes_label_de(year: int, month: int) -> str:
+    return f"{MESES_ES[month - 1]} {year}"
 
-    Antes se tomaba siempre el mes (regla ISO del jueves) de la ÚLTIMA semana
-    cargada. Eso falla justo en el cambio de mes: la semana que arranca a
-    fines de septiembre (p. ej. "2026-40", lunes 28-sep a domingo 4-oct) tiene
-    su jueves ya en octubre, así que esa sola semana hacía que TODO el
-    dashboard saltara a "Octubre" aunque hoy realmente sea todavía septiembre
-    y las demás semanas cargadas sean de septiembre — de ahí el reporte de
-    "me lee solo octubre".
 
-    Regla corregida: el mes en curso es el mes calendario REAL de hoy. Si los
-    datos cargados todavía no llegan a ese mes (por ejemplo, se está viendo un
-    archivo histórico/de prueba de meses anteriores), se usa como respaldo el
-    mes de la última semana cargada, para no dejar el dashboard vacío.
+def semana_bounds(semana: str):
+    """(lunes, domingo) de una semana ISO 'YYYY-WW'."""
+    y, w = semana.split("-")
+    lunes = datetime.date.fromisocalendar(int(y), int(w), 1)
+    domingo = datetime.date.fromisocalendar(int(y), int(w), 7)
+    return lunes, domingo
 
-    Además, la semana que contiene la fecha de HOY se cuenta siempre dentro
-    de las semanas del mes en curso para efectos de Presupuesto/Ritmo, aunque
-    su jueves (regla ISO) caiga técnicamente en el mes siguiente: mientras se
-    esté viviendo esa semana, sus ventas pertenecen al mes en curso — es la
-    misma semana "bisagra" del caso anterior."""
+
+def meses_tocados_por_semana(semana: str):
+    """Meses (year, month) que toca el rango lunes-domingo de una semana ISO
+    — normalmente uno solo; dos si la semana es "bisagra" entre dos meses
+    (p. ej. "2026-40", lunes 28-sep a domingo 4-oct, toca Septiembre Y
+    Octubre)."""
+    lunes, domingo = semana_bounds(semana)
+    return {(lunes.year, lunes.month), (domingo.year, domingo.month)}
+
+
+def meses_disponibles(all_weeks):
+    """Lista ordenada de (year, month) para todos los meses que toca, aunque
+    sea parcialmente, alguna semana cargada. Alimenta las opciones del filtro
+    de Mes."""
+    meses = set()
+    for w in all_weeks:
+        meses |= meses_tocados_por_semana(w)
+    return sorted(meses)
+
+
+def weeks_for_meses(all_weeks, meses_sel):
+    """Todas las semanas (de las cargadas) cuyo rango lunes-domingo toca
+    alguno de los meses (year, month) en meses_sel. Una semana "bisagra"
+    entre dos meses aparece si seleccionas cualquiera de los dos — pero sin
+    duplicarse en el resultado (es un conjunto de semanas), así que
+    seleccionar varios meses junto con su semana bisagra compartida no cuenta
+    esa semana dos veces."""
+    meses_set = set(meses_sel)
+    return sorted(w for w in all_weeks if meses_tocados_por_semana(w) & meses_set)
+
+
+def mes_en_curso_default(all_weeks):
+    """Mes (year, month) preseleccionado por defecto en el filtro de Mes: el
+    mes calendario real de hoy, salvo que los datos cargados sean más viejos
+    que hoy (archivo histórico o de prueba), en cuyo caso se usa el mes
+    (regla ISO del jueves) de la última semana cargada, para no dejar el
+    dashboard vacío por defecto."""
     hoy = datetime.date.today()
-    mes_label = f"{MESES_ES[hoy.month - 1]} {hoy.year}"
     year, month = hoy.year, hoy.month
-    usando_hoy = True
-
-    if df_all is not None and not df_all.empty:
-        weeks_sorted = sorted(df_all["Semana"].unique())
-        _, ult_year, ult_month = semana_a_mes(weeks_sorted[-1])
+    if all_weeks:
+        _, ult_year, ult_month = semana_a_mes(sorted(all_weeks)[-1])
         if (ult_year, ult_month) < (year, month):
-            mes_label, year, month = semana_a_mes(weeks_sorted[-1])
-            usando_hoy = False
-
-    weeks_mes = weeks_in_month(year, month)
-    if usando_hoy:
-        iso_year, iso_week, _ = hoy.isocalendar()
-        semana_hoy = f"{iso_year}-{iso_week:02d}"
-        if semana_hoy not in weeks_mes:
-            weeks_mes = sorted(weeks_mes + [semana_hoy])
-
-    return mes_label, year, month, weeks_mes
+            year, month = ult_year, ult_month
+    return year, month
 
 
 def estado_ritmo(ritmo):
@@ -432,25 +449,26 @@ def compute_inventario_actual(df: pd.DataFrame) -> pd.DataFrame:
     return out.rename(columns={"Inventario_Val": "inventario"})
 
 
-def compute_contribucion_budget_comparison(df_all: pd.DataFrame, grupos_sel, marcas_sel):
-    """Presupuesto de Contribución vs. Real del mes en curso completo. A
-    diferencia del Presupuesto de Venta (que viene en su propia hoja), este
-    presupuesto llega como una columna más de Sheet1 con un único valor total
-    por marca (no una serie semanal) — se toma el último valor no vacío
-    reportado para esa marca en el mes, nunca se suma entre semanas."""
-    if df_all.empty or "PresupContrib_Miles" not in df_all.columns:
+def compute_contribucion_budget_comparison(df_all: pd.DataFrame, grupos_sel, marcas_sel, weeks_mes, mes_label):
+    """Presupuesto de Contribución vs. Real del/los mes(es) seleccionado(s)
+    en el filtro de Mes. A diferencia del Presupuesto de Venta (que viene en
+    su propia hoja), este presupuesto llega como una columna más de Sheet1
+    con un único valor total por marca (no una serie semanal) — se toma el
+    último valor no vacío reportado para esa marca, nunca se suma entre
+    semanas. `weeks_mes` ya viene calculado (vía weeks_for_meses) incluyendo
+    cualquier semana "bisagra" que toque el/los mes(es) elegido(s)."""
+    if df_all.empty or "PresupContrib_Miles" not in df_all.columns or not weeks_mes:
         return None
     if df_all["PresupContrib_Miles"].notna().sum() == 0:
         return None
 
-    mes_label, year, month, weeks_mes = mes_en_curso(df_all)
     reported = [w for w in weeks_mes if w in set(df_all["Semana"])]
     pct_avance = len(reported) / len(weeks_mes) if weeks_mes else 0
 
-    # Se filtra por la lista de semanas del mes en curso (weeks_mes), no por
-    # la etiqueta "Mes" de cada fila: así la semana "bisagra" que hoy cuenta
-    # como parte del mes en curso se incluye aunque su jueves (regla ISO)
-    # caiga en el mes siguiente.
+    # Se filtra por la lista de semanas del mes elegido (weeks_mes), no por
+    # la etiqueta "Mes" de cada fila: así una semana "bisagra" que toque el
+    # mes seleccionado se incluye aunque su jueves (regla ISO) caiga en el
+    # mes vecino.
     df_mes = df_all[df_all["Semana"].isin(weeks_mes)]
 
     contrib_real = (
@@ -504,31 +522,35 @@ def compute_contribucion_budget_comparison(df_all: pd.DataFrame, grupos_sel, mar
     }
 
 
-def compute_budget_comparison(df_all: pd.DataFrame, presu: pd.DataFrame, grupos_sel, marcas_sel):
-    """Presupuesto vs. Real del mes en curso completo (ignora filtro de Semana,
-    pero sí respeta Grupo y Marca), igual que en el HTML/Excel originales."""
-    if df_all.empty or presu is None or presu.empty:
+def compute_budget_comparison(df_all: pd.DataFrame, presu: pd.DataFrame, grupos_sel, marcas_sel, meses_sel, weeks_mes, mes_label):
+    """Presupuesto vs. Real del/los mes(es) seleccionado(s) en el filtro de
+    Mes (ignora el filtro de Semana, pero sí respeta Grupo y Marca), igual
+    que en el HTML/Excel originales. Si se seleccionan varios meses, el
+    presupuesto se suma por marca entre esos meses."""
+    if df_all.empty or presu is None or presu.empty or not weeks_mes:
         return None
 
-    mes_label, year, month, weeks_mes = mes_en_curso(df_all)
     reported = [w for w in weeks_mes if w in set(df_all["Semana"])]
     pct_avance = len(reported) / len(weeks_mes) if weeks_mes else 0
 
     # Igual que en Presupuesto de Contribución: se filtra por la lista de
-    # semanas del mes en curso (weeks_mes), no por la etiqueta "Mes" de cada
-    # fila, para incluir la semana "bisagra" de hoy aunque su jueves caiga en
-    # el mes siguiente.
+    # semanas del mes elegido (weeks_mes), no por la etiqueta "Mes" de cada
+    # fila, para incluir una semana "bisagra" que toque el mes seleccionado
+    # aunque su jueves caiga en el mes vecino.
     venta_mes = (
         df_all[df_all["Semana"].isin(weeks_mes)]
         .groupby("Marca", as_index=False)["Venta_USD"].sum()
         .rename(columns={"Venta_USD": "venta_real"})
     )
 
-    presu_mes = presu[presu["Mes_Fecha"].dt.to_period("M") == pd.Timestamp(year=year, month=month, day=1).to_period("M")]
+    periodos_sel = {pd.Timestamp(year=y, month=m, day=1).to_period("M") for (y, m) in meses_sel}
+    presu_mes = presu[presu["Mes_Fecha"].dt.to_period("M").isin(periodos_sel)]
     presu_mes = presu_mes[presu_mes["Grupo Compra"].isin(grupos_sel) & presu_mes["Marca"].isin(marcas_sel)]
     if presu_mes.empty:
         return None
-    presu_mes = presu_mes[["Marca", "Grupo Compra", "Presupuesto_Miles"]].copy()
+    # Si se seleccionó más de un mes, se suma el presupuesto de cada marca
+    # entre esos meses (nunca se promedia ni se toma solo el último).
+    presu_mes = presu_mes.groupby(["Marca", "Grupo Compra"], as_index=False)["Presupuesto_Miles"].sum()
     presu_mes["presupuesto"] = presu_mes["Presupuesto_Miles"] * 1000
 
     rows = presu_mes.merge(venta_mes, on="Marca", how="left")
@@ -558,14 +580,16 @@ def compute_budget_comparison(df_all: pd.DataFrame, presu: pd.DataFrame, grupos_
     }
 
 
-def order_acciones_by_budget(acciones_full: pd.DataFrame, presu: pd.DataFrame, df_all: pd.DataFrame):
-    """Ordena la tabla de Acciones de mayor a menor presupuesto del mes en
-    curso; las marcas sin presupuesto quedan al final, en orden alfabético."""
+def order_acciones_by_budget(acciones_full: pd.DataFrame, presu: pd.DataFrame, df_all: pd.DataFrame, meses_sel):
+    """Ordena la tabla de Acciones de mayor a menor presupuesto del/los
+    mes(es) seleccionado(s) en el filtro de Mes; las marcas sin presupuesto
+    quedan al final, en orden alfabético. Si hay varios meses seleccionados,
+    se suma el presupuesto de cada marca entre esos meses."""
     budget_map = {}
-    if presu is not None and not presu.empty and not df_all.empty:
-        _, year, month, _ = mes_en_curso(df_all)
-        presu_mes = presu[presu["Mes_Fecha"].dt.to_period("M") == pd.Timestamp(year=year, month=month, day=1).to_period("M")]
-        budget_map = dict(zip(presu_mes["Marca"], presu_mes["Presupuesto_Miles"] * 1000))
+    if presu is not None and not presu.empty and not df_all.empty and meses_sel:
+        periodos_sel = {pd.Timestamp(year=y, month=m, day=1).to_period("M") for (y, m) in meses_sel}
+        presu_mes = presu[presu["Mes_Fecha"].dt.to_period("M").isin(periodos_sel)]
+        budget_map = (presu_mes.groupby("Marca")["Presupuesto_Miles"].sum() * 1000).to_dict()
 
     def sort_key(marca):
         if marca in budget_map:
@@ -679,12 +703,7 @@ if "raw" not in st.session_state:
 
 with st.sidebar:
     st.header("📤 Actualizar datos")
-    st.caption(
-        'Sube el archivo recurrente **"Ventas actualizadas.xlsx"** '
-        '(hojas Sheet1, Presupuesto y Acciones). Reemplaza por completo '
-        'los datos actuales. Sheet1 puede incluir además las columnas '
-        'opcionales "Inventario" y "Presupuesto de contribución".'
-    )
+    st.caption("Carga ventas actualizadas")
     uploaded = st.file_uploader("Archivo .xlsx", type=["xlsx"], label_visibility="collapsed")
     if uploaded is not None:
         try:
@@ -719,16 +738,42 @@ BRAND_GRUPO = dict(zip(raw["Marca"], raw["Grupo"]))
 
 acciones_full = build_full_acciones(acciones_hits, ALL_BRANDS)
 
+# Meses disponibles según las semanas cargadas (una semana "bisagra" entre
+# dos meses hace que ambos aparezcan como opción), y el mes que viene
+# preseleccionado por defecto (el mes real de hoy, o el de la última semana
+# cargada si los datos son más viejos que hoy).
+MESES_DISPONIBLES = meses_disponibles(ALL_WEEKS)
+MES_LABELS = {t: mes_label_de(*t) for t in MESES_DISPONIBLES}
+MES_LABEL_TO_TUPLE = {v: k for k, v in MES_LABELS.items()}
+default_mes_tuple = mes_en_curso_default(ALL_WEEKS)
+if default_mes_tuple not in MES_LABELS and MESES_DISPONIBLES:
+    default_mes_tuple = MESES_DISPONIBLES[-1]
+
 # ----------------------------------------------------------------------
 # Encabezado + filtros
 # ----------------------------------------------------------------------
-st.title("Ventas de marcas Febeca")
+header_izq, header_der = st.columns([5, 1])
+with header_izq:
+    st.title("Ventas de marcas Febeca")
+with header_der:
+    st.markdown(
+        "<div style='text-align:right; padding-top:22px; color:#888; "
+        "font-style:italic; font-size:0.95rem; font-weight:bold;'>MAR</div>",
+        unsafe_allow_html=True,
+    )
 st.caption(
     f"Venta, Activación de clientes, Rotación y Contribución por marca · "
     f"Semanas {ALL_WEEKS[0]} a {ALL_WEEKS[-1]} · Fuente: {st.session_state.data_label}"
 )
 
-f1, f2, f3, f4 = st.columns([1.3, 1, 1.3, 0.8])
+f0, f1, f2, f3, f4 = st.columns([1.3, 1.3, 1, 1.3, 0.8])
+with f0:
+    meses_labels_sel = st.multiselect(
+        "Mes", [MES_LABELS[t] for t in MESES_DISPONIBLES],
+        default=[MES_LABELS[default_mes_tuple]] if default_mes_tuple in MES_LABELS else [],
+        help='Si una semana cae en dos meses (p. ej. empieza en septiembre y '
+             'termina en octubre), aparece en el mes que elijas aquí.',
+    )
 with f1:
     weeks_sel = st.multiselect("Semana", ALL_WEEKS, default=ALL_WEEKS)
 with f2:
@@ -738,12 +783,25 @@ with f3:
 with f4:
     top_n = st.selectbox("Top N", [5, 10, 15, len(ALL_BRANDS)], index=1)
 
-if not weeks_sel or not grupos_sel or not brands_sel:
-    st.warning("Selecciona al menos una Semana, un Grupo de Compra y una Marca.")
+if not meses_labels_sel or not weeks_sel or not grupos_sel or not brands_sel:
+    st.warning("Selecciona al menos un Mes, una Semana, un Grupo de Compra y una Marca.")
     st.stop()
 
-df_filtered = raw[raw["Semana"].isin(weeks_sel) & raw["Grupo"].isin(grupos_sel) & raw["Marca"].isin(brands_sel)]
-# Presupuesto vs. Real ignora el filtro de Semana (mira siempre el mes completo)
+meses_sel = sorted(MES_LABEL_TO_TUPLE[l] for l in meses_labels_sel)
+# Semanas que tocan el/los mes(es) elegido(s) (incluye semanas "bisagra").
+weeks_mes_filtro = weeks_for_meses(ALL_WEEKS, meses_sel)
+mes_label_sel = " + ".join(MES_LABELS[t] for t in meses_sel)
+
+# KPI, tablas y gráficos: respetan Mes, Semana, Grupo y Marca (Semana permite
+# acotar más fino dentro del/los mes(es) elegido(s)).
+df_filtered = raw[
+    raw["Semana"].isin(weeks_sel)
+    & raw["Semana"].isin(weeks_mes_filtro)
+    & raw["Grupo"].isin(grupos_sel)
+    & raw["Marca"].isin(brands_sel)
+]
+# Presupuesto vs. Real ignora el filtro de Semana (mira siempre el/los
+# mes(es) elegido(s) completos), pero sí respeta Mes, Grupo y Marca.
 df_for_budget = raw[raw["Grupo"].isin(grupos_sel) & raw["Marca"].isin(brands_sel)]
 
 brand_agg = aggregate_by_brand(df_filtered)
@@ -765,18 +823,19 @@ if view is None:
 
 if view == "💰 Presupuesto":
     st.subheader("Presupuesto de Venta vs. Real")
-    budget = compute_budget_comparison(df_for_budget, presu, grupos_sel, brands_sel)
+    budget = compute_budget_comparison(df_for_budget, presu, grupos_sel, brands_sel, meses_sel, weeks_mes_filtro, mes_label_sel)
     if budget is None:
         st.info(
-            "No hay marcas con presupuesto asignado para los filtros de Grupo/Marca "
+            "No hay marcas con presupuesto asignado para los filtros de Mes/Grupo/Marca "
             "seleccionados, o no se cargó una hoja de Presupuesto todavía."
         )
     else:
         st.caption(
-            f"Mes en curso: **{budget['mes_label']}** — compara siempre el mes completo "
-            "(no responde al filtro de Semana), pero sí a Grupo de Compra y Marca. "
+            f"Mes(es) seleccionado(s): **{budget['mes_label']}** — compara siempre el/los "
+            "mes(es) completo(s) (no responde al filtro de Semana), pero sí al filtro de "
+            "Mes, Grupo de Compra y Marca. "
             f"Semanas reportadas: {len(budget['reported'])} de {len(budget['weeks_mes'])} "
-            f"({budget['pct_avance']:.1%} de avance del mes)."
+            f"({budget['pct_avance']:.1%} de avance)."
         )
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric(f"Presupuesto {budget['mes_label']} (USD)", f"${budget['total_presu']:,.0f}")
@@ -789,7 +848,7 @@ if view == "💰 Presupuesto":
         st.plotly_chart(
             hbar_chart(
                 rows_sorted["Marca"], rows_sorted["cumplimiento"], AQUA,
-                fmt=fmt_pct, title="% Cumplimiento de presupuesto por marca (mes en curso)",
+                fmt=fmt_pct, title=f"% Cumplimiento de presupuesto por marca ({mes_label_sel})",
             ),
             width='stretch',
         )
@@ -805,7 +864,7 @@ if view == "💰 Presupuesto":
 
     st.divider()
     st.subheader("Presupuesto de Contribución vs. Real")
-    budget_c = compute_contribucion_budget_comparison(df_for_budget, grupos_sel, brands_sel)
+    budget_c = compute_contribucion_budget_comparison(df_for_budget, grupos_sel, brands_sel, weeks_mes_filtro, mes_label_sel)
     if budget_c is None:
         st.info(
             "No hay marcas con presupuesto de contribución asignado para los filtros "
@@ -814,10 +873,10 @@ if view == "💰 Presupuesto":
         )
     else:
         st.caption(
-            f"Mes en curso: **{budget_c['mes_label']}** — mismo criterio que el "
-            "presupuesto de venta: compara siempre el mes completo (no responde al "
-            "filtro de Semana), pero sí a Grupo de Compra y Marca. El presupuesto de "
-            "contribución es un total por marca (no una serie semanal), así que nunca "
+            f"Mes(es) seleccionado(s): **{budget_c['mes_label']}** — mismo criterio que el "
+            "presupuesto de venta: compara siempre el/los mes(es) completo(s) (no responde "
+            "al filtro de Semana), pero sí al filtro de Mes, Grupo de Compra y Marca. El "
+            "presupuesto de contribución es un total por marca (no una serie semanal), así que nunca "
             "se suma entre semanas."
         )
         d1, d2, d3, d4, d5 = st.columns(5)
@@ -831,7 +890,7 @@ if view == "💰 Presupuesto":
         st.plotly_chart(
             hbar_chart(
                 rows_sorted_c["Marca"], rows_sorted_c["cumplimiento"], VIOLET,
-                fmt=fmt_pct, title="% Cumplimiento de presupuesto de contribución por marca (mes en curso)",
+                fmt=fmt_pct, title=f"% Cumplimiento de presupuesto de contribución por marca ({mes_label_sel})",
             ),
             width='stretch',
         )
@@ -944,12 +1003,12 @@ with st.expander("Ver rotación promedio por mes y marca (matriz)"):
 @st.dialog("📋 Acciones por Marca", width="large")
 def acciones_dialog():
     st.caption(
-        "Ordenada de mayor a menor presupuesto del mes en curso (las marcas sin "
-        "presupuesto quedan al final, alfabético). Respeta los filtros de Grupo "
+        f"Ordenada de mayor a menor presupuesto de {mes_label_sel} (las marcas sin "
+        "presupuesto quedan al final, alfabético). Respeta los filtros de Mes, Grupo "
         "de Compra y Marca de arriba, no el de Semana."
     )
     filtro_marca = st.text_input("Buscar marca…", key="acc_f_marca")
-    ordered = order_acciones_by_budget(acciones_full, presu, df_for_budget)
+    ordered = order_acciones_by_budget(acciones_full, presu, df_for_budget, meses_sel)
     view_df = ordered[ordered["Marca"].isin(brands_sel) & ordered["Marca"].map(BRAND_GRUPO).isin(grupos_sel)].copy()
     if filtro_marca:
         view_df = view_df[view_df["Marca"].str.contains(filtro_marca, case=False, na=False)]
@@ -966,19 +1025,22 @@ if st.button("📋 Acciones por marca"):
 # Notas al pie
 # ----------------------------------------------------------------------
 st.divider()
-st.caption(
-    '**Notas:** "Venta" corresponde a la columna "Venta Neta" del archivo original '
-    "(máscara miles de USD, convertida a USD); \"Contribución\" también se convirtió "
-    'de miles de USD a USD. "Clientes Activados" se SUMA por marca/grupo/semana; '
-    '"Rotación" siempre se PROMEDIA, nunca se suma — se reporta mayormente en semanas '
-    "sin venta y debe interpretarse con cautela. \"Grupo de Compra\" es un atributo "
-    'propio de cada marca. La sección "Presupuesto vs. Real" compara siempre el mes '
-    "en curso completo y solo incluye marcas con presupuesto asignado; \"Ritmo\" "
-    "compara el % de presupuesto alcanzado contra el % de semanas ya transcurridas "
-    "del mes. Las marcas sin ninguna acción registrada se muestran con la celda de "
-    'Acción vacía. "Inventario" también viene en miles de USD (convertido a USD) '
-    "y es el último nivel reportado por marca (nunca se suma entre semanas). "
-    '"Presupuesto de Contribución" es un total por marca '
-    "(no semanal) y se compara contra la Contribución real del mes en curso con "
-    "el mismo criterio que el Presupuesto de Venta."
-)
+with st.expander("Notas", expanded=False):
+    st.caption(
+        '**Notas:** "Venta" corresponde a la columna "Venta Neta" del archivo original '
+        "(máscara miles de USD, convertida a USD); \"Contribución\" también se convirtió "
+        'de miles de USD a USD. "Clientes Activados" se SUMA por marca/grupo/semana; '
+        '"Rotación" siempre se PROMEDIA, nunca se suma — se reporta mayormente en semanas '
+        "sin venta y debe interpretarse con cautela. \"Grupo de Compra\" es un atributo "
+        'propio de cada marca. La sección "Presupuesto vs. Real" compara siempre el '
+        "mes (o meses) completos elegidos en el filtro de Mes y solo incluye marcas "
+        'con presupuesto asignado; "Ritmo" compara el % de presupuesto alcanzado '
+        "contra el % de semanas ya transcurridas del mes. Una semana que cae en dos "
+        "meses (bisagra) se cuenta en el mes que selecciones, nunca en los dos a la "
+        "vez. Las marcas sin ninguna acción registrada se muestran con la celda de "
+        'Acción vacía. "Inventario" también viene en miles de USD (convertido a USD) '
+        "y es el último nivel reportado por marca (nunca se suma entre semanas). "
+        '"Presupuesto de Contribución" es un total por marca '
+        "(no semanal) y se compara contra la Contribución real del mes elegido con "
+        "el mismo criterio que el Presupuesto de Venta."
+    )
