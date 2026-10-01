@@ -667,7 +667,7 @@ def kpi_por_region_tabla(
             "clientes": clientes, "marcas_activas": marcas_activas, "marcas_total": marcas_total,
             "concentracion": concentracion, "inventario": inventario,
         })
-    return pd.DataFrame(filas)
+    return pd.DataFrame(filas).sort_values("venta", ascending=False).reset_index(drop=True)
 
 
 def compute_inventario_actual(df: pd.DataFrame) -> pd.DataFrame:
@@ -977,10 +977,6 @@ def render_kpi_view(brand_agg: pd.DataFrame, week_agg: pd.DataFrame, grupo_agg: 
     if tiene_inventario:
         k7, _, _ = st.columns(3)
         k7.metric("Inventario actual (USD)", f"${total_inventario:,.0f}")
-        st.caption(
-            "Inventario actual = suma del último nivel reportado por cada marca "
-            "(nunca se suma entre semanas; cada marca aporta su dato más reciente)."
-        )
 
     if region_breakdown is not None and not region_breakdown.empty:
         st.markdown("**Indicadores por Región**")
