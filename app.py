@@ -1202,13 +1202,6 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Error al leer el archivo: {e}")
 
-    st.divider()
-    st.caption(
-        "El presupuesto, las acciones y la venta mensual (hoja Sheet2) se "
-        "refrescan solo si el archivo subido trae esas hojas; de lo "
-        "contrario se conservan los últimos valores cargados."
-    )
-
 raw = derive_raw(st.session_state.raw)
 presu = st.session_state.presu
 acciones_hits = st.session_state.acciones_hits
@@ -1264,8 +1257,14 @@ header_izq, header_der = st.columns([5, 1])
 with header_izq:
     st.title("Ventas de marcas Febeca")
 with header_der:
-    logo_path = Path(__file__).parent / "febeca_logo.png"
-    if logo_path.exists():
+    # Se busca el logo tanto en la raíz del repo como en "assets/", para no
+    # depender de en cuál de las dos ubicaciones haya quedado subido.
+    _logo_candidatos = [
+        Path(__file__).parent / "febeca_logo.png",
+        Path(__file__).parent / "assets" / "febeca_logo.png",
+    ]
+    logo_path = next((p for p in _logo_candidatos if p.exists()), None)
+    if logo_path is not None:
         try:
             st.image(str(logo_path), width='stretch')
         except Exception:
