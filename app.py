@@ -1183,6 +1183,26 @@ if "raw" not in st.session_state:
 
 with st.sidebar:
     st.header("📤 Actualizar datos")
+    # Plantilla descargable: mismas hojas y columnas que espera este
+    # dashboard (Sheet1, Presupuesto, Acciones y Sheet2), con un ejemplo por
+    # hoja para llenar y volver a subir. Si el archivo no está en el repo
+    # (p. ej. se eliminó sin querer), simplemente se omite el botón en vez
+    # de tumbar la app.
+    plantilla_path = Path(__file__).parent / "assets" / "Plantilla_Ventas_actualizadas.xlsx"
+    if plantilla_path.exists():
+        try:
+            st.download_button(
+                "⬇️ Descargar plantilla",
+                data=plantilla_path.read_bytes(),
+                file_name="Plantilla_Ventas_actualizadas.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                help="Plantilla en blanco con las mismas hojas y columnas que espera "
+                     "este dashboard (Sheet1, Presupuesto, Acciones y Sheet2), con un "
+                     "ejemplo por hoja y una guía de llenado en la pestaña Instrucciones.",
+                width='stretch',
+            )
+        except Exception:
+            pass
     st.caption("Carga ventas actualizadas")
     uploaded = st.file_uploader("Archivo .xlsx", type=["xlsx"], label_visibility="collapsed")
     if uploaded is not None:
